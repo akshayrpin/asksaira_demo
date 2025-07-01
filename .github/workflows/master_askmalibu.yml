@@ -22,15 +22,15 @@ jobs:
     - name: Log in to registry
       uses: docker/login-action@v2
       with:
-        registry: https://github.com/akshayrpin//
-        username: ${{ secrets.AzureAppService_ContainerUsername_ade54f86f5b943acb1a4b33bfcd56295 }}
-        password: ${{ secrets.AzureAppService_ContainerPassword_52c55a6727f746e1a4d21f6ed230d7b8 }}
+        registry: https://github.com/
+        username: ${{ secrets.AzureAppService_ContainerUsername_7885f3152e9148b5be609246cfff5daf }}
+        password: ${{ secrets.AzureAppService_ContainerPassword_1c258cedbc81485ca85180659dbaeb11 }}
 
     - name: Build and push container image to registry
       uses: docker/build-push-action@v3
       with:
         push: true
-        tags: github.com/akshayrpin//${{ secrets.AzureAppService_ContainerUsername_ade54f86f5b943acb1a4b33bfcd56295 }}/asksaira_demo:${{ github.sha }}
+        tags: github.com/${{ secrets.AzureAppService_ContainerUsername_7885f3152e9148b5be609246cfff5daf }}/asksaira_demo.git:${{ github.sha }}
         file: ./Dockerfile
 
   deploy:
@@ -47,5 +47,5 @@ jobs:
       with:
         app-name: 'askmalibu'
         slot-name: 'production'
-        publish-profile: ${{ secrets.AzureAppService_PublishProfile_129e2980428f44bfaae63c967a05d2e6 }}
-        images: 'github.com/akshayrpin//${{ secrets.AzureAppService_ContainerUsername_ade54f86f5b943acb1a4b33bfcd56295 }}/asksaira_demo:${{ github.sha }}'
+        publish-profile: ${{ secrets.AzureAppService_PublishProfile_5e1f651bcf9e44dfa760b79b090a9caf }}
+        images: 'github.com/${{ secrets.AzureAppService_ContainerUsername_7885f3152e9148b5be609246cfff5daf }}/asksaira_demo.git:${{ github.sha }}'
