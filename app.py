@@ -120,7 +120,8 @@ frontend_settings = {
         "limitations_2": app_settings.ui.limitations_2,
         "limitations_3": app_settings.ui.limitations_3,
         "chat_resp_logo": app_settings.ui.chat_resp_logo,
-        "hand_wave_icon": app_settings.ui.hand_wave_icon
+        "hand_wave_icon": app_settings.ui.hand_wave_icon,
+        "show_permit_link": app_settings.ui.show_permit_link
     },
     "sanitize_answer": app_settings.base_settings.sanitize_answer,
     "oyd_enabled": app_settings.base_settings.datasource_type,

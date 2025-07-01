@@ -158,6 +158,7 @@ export type UI = {
   limitations_2:string
   limitations_3:string
   chat_resp_logo:string
+  show_permit_link?: boolean
 }
 
 export type FrontendSettings = {

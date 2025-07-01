@@ -70,6 +70,7 @@ class _UiSettings(BaseSettings):
     limitations_3: Optional[str] = None
     chat_resp_logo: Optional[str] = None
     hand_wave_icon: Optional[str] = None
+    show_permit_link: bool = False
 
 class _ChatHistorySettings(BaseSettings):
     model_config = SettingsConfigDict(

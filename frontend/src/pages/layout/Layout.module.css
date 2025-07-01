@@ -51,6 +51,16 @@
   color: #1f54e4;
 }
 
+.permitlink {
+  font-style: italic;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 28px;
+  display: flex;
+  align-items: flex-end;
+  color: #1f54e4;
+}
+
 .headerIcon {
   height: 32px;
   width: auto;
