@@ -82,6 +82,8 @@ async def assets(path):
 DEBUG = os.environ.get("DEBUG", "false")
 if DEBUG.lower() == "true":
     logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
 
 USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
 
@@ -318,7 +320,8 @@ def prepare_model_args(request_body, request_headers):
                         "embedding_dependency"
                     ]["authentication"][field] = "*****"
 
-    logging.debug(f"REQUEST BODY: {json.dumps(model_args_clean, indent=4)}")
+    user_query = next((m["content"] for m in reversed(model_args_clean["messages"]) if m["role"] == "user"), None)
+    logging.info(f"[USER QUERY] {user_query}")
 
     return model_args
 
@@ -370,7 +373,15 @@ async def send_chat_request(request_body, request_headers):
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id") 
+        apim_request_id = raw_response.headers.get("apim-request-id")
+
+        message = response.choices[0].message
+        logging.info(f"[OPENAI RESPONSE] {message.content}")
+        context = getattr(message, "context", None)
+        if context:
+            if isinstance(context, dict) and context.get("intent"):
+                logging.info(f"[REFORMULATED QUERY] {context['intent']}")
+            logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
