@@ -80,10 +80,10 @@ async def assets(path):
 
 # Debug settings
 DEBUG = os.environ.get("DEBUG", "false")
-if DEBUG.lower() == "true":
-    logging.basicConfig(level=logging.DEBUG)
-else:
-    logging.basicConfig(level=logging.INFO)
+log_level = logging.DEBUG if DEBUG.lower() == "true" else logging.INFO
+# force=True replaces gunicorn's root logger config (which defaults to WARNING
+# and would otherwise silence our INFO-level [USER QUERY]/[RETRIEVED CHUNKS] logs)
+logging.basicConfig(level=log_level, force=True)
 
 USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
 
