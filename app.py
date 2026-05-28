@@ -375,13 +375,14 @@ async def send_chat_request(request_body, request_headers):
         response = raw_response.parse()
         apim_request_id = raw_response.headers.get("apim-request-id")
 
-        message = response.choices[0].message
-        logging.info(f"[OPENAI RESPONSE] {message.content}")
-        context = getattr(message, "context", None)
-        if context:
-            if isinstance(context, dict) and context.get("intent"):
-                logging.info(f"[REFORMULATED QUERY] {context['intent']}")
-            logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
+        if not app_settings.azure_openai.stream:
+            message = response.choices[0].message
+            logging.info(f"[OPENAI RESPONSE] {message.content}")
+            context = getattr(message, "context", None)
+            if context:
+                if isinstance(context, dict) and context.get("intent"):
+                    logging.info(f"[REFORMULATED QUERY] {context['intent']}")
+                logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
@@ -410,8 +411,23 @@ async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
     
     async def generate():
+        context_logged = False
+        full_response = []
         async for completionChunk in response:
+            if len(completionChunk.choices) > 0:
+                delta = completionChunk.choices[0].delta
+                if not context_logged:
+                    context = getattr(delta, "context", None)
+                    if context:
+                        if isinstance(context, dict) and context.get("intent"):
+                            logging.info(f"[REFORMULATED QUERY] {context['intent']}")
+                        logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
+                        context_logged = True
+                if getattr(delta, "content", None):
+                    full_response.append(delta.content)
             yield format_stream_response(completionChunk, history_metadata, apim_request_id)
+        if full_response:
+            logging.info(f"[OPENAI RESPONSE] {''.join(full_response)}")
 
     return generate()
 
