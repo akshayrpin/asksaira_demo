@@ -84,6 +84,8 @@ log_level = logging.DEBUG if DEBUG.lower() == "true" else logging.INFO
 # force=True replaces gunicorn's root logger config (which defaults to WARNING
 # and would otherwise silence our INFO-level [USER QUERY]/[RETRIEVED CHUNKS] logs)
 logging.basicConfig(level=log_level, force=True)
+# Azure SDKs log every HTTP request/response at INFO; silence that noise
+logging.getLogger("azure").setLevel(logging.WARNING)
 
 USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
 
@@ -359,18 +361,89 @@ async def promptflow_request(request):
         logging.error(f"An error occurred while making promptflow_request: {e}")
 
 
+# --- Domain routing: send each question to the right scoped index ----------------
+# website (people/officials/contacts/services/FAQs) stays on the default index;
+# permit and codes questions are rerouted to their dedicated indexes so the dense
+# municipal-code text can't drown out, or be drowned by, the other domains.
+PERMITS_INDEX = os.environ.get("AZURE_SEARCH_INDEX_PERMITS")
+CODES_INDEX = os.environ.get("AZURE_SEARCH_INDEX_CODES")
+# Routing is OPT-IN: active only when BOTH domain indexes are configured. Apps
+# without these env vars (other cities, or prod until it's ready) behave exactly
+# as before, no classifier call, no rerouting.
+INDEX_ROUTING_ENABLED = bool(PERMITS_INDEX and CODES_INDEX)
+
+ROUTER_SYSTEM_MESSAGE = (
+    "You route a resident's question for a city government assistant to ONE data source. "
+    "Reply with exactly one lowercase word: website, permit, or codes.\n"
+    "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
+    "city services, news, events, FAQs, how-to questions.\n"
+    "- permit: building/construction permits, permit status, project records, "
+    "license or permit applications.\n"
+    "- codes: the municipal code, ordinances, or legal regulations (zoning, setbacks, "
+    "what the code/law says).\n"
+    "If you are unsure, answer website."
+)
+
+
+async def classify_domain(user_query, client):
+    """Return 'website' | 'permit' | 'codes' for a question. Defaults to website on any failure."""
+    if not user_query:
+        return "website"
+    try:
+        resp = await client.chat.completions.create(
+            model=app_settings.azure_openai.model,
+            messages=[
+                {"role": "system", "content": ROUTER_SYSTEM_MESSAGE},
+                {"role": "user", "content": user_query},
+            ],
+            temperature=0,
+            max_tokens=5,
+        )
+        label = (resp.choices[0].message.content or "").strip().lower()
+    except Exception:
+        logging.exception("Domain classifier failed; defaulting to website")
+        return "website"
+    if "permit" in label:
+        return "permit"
+    if "code" in label:
+        return "codes"
+    return "website"
+
+
+async def route_index(user_query, client):
+    """Map the classified domain to an index name, or None to keep the default (website)."""
+    domain = await classify_domain(user_query, client)
+    if domain == "permit":
+        return PERMITS_INDEX
+    if domain == "codes":
+        return CODES_INDEX
+    return None
+
+
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
     for message in messages:
         if message.get("role") != 'tool':
             filtered_messages.append(message)
-            
+
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
 
     try:
         azure_openai_client = await init_openai_client()
+
+        # Route this question to the right scoped index (website stays default).
+        if INDEX_ROUTING_ENABLED and app_settings.datasource and model_args.get("extra_body"):
+            user_query = next(
+                (m["content"] for m in reversed(filtered_messages) if m.get("role") == "user"),
+                None,
+            )
+            routed_index = await route_index(user_query, azure_openai_client)
+            if routed_index:
+                model_args["extra_body"]["data_sources"][0]["parameters"]["index_name"] = routed_index
+                logging.info(f"[ROUTED INDEX] {routed_index}")
+
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         response = raw_response.parse()
         apim_request_id = raw_response.headers.get("apim-request-id")
