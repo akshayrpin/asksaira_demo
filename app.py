@@ -376,11 +376,13 @@ ROUTER_SYSTEM_MESSAGE = (
     "You route a resident's question for a city government assistant to ONE data source. "
     "Reply with exactly one lowercase word: website, permit, or codes.\n"
     "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
-    "city services, news, events, FAQs, how-to questions.\n"
-    "- permit: building/construction permits, permit status, project records, "
-    "license or permit applications.\n"
-    "- codes: the municipal code, ordinances, or legal regulations (zoning, setbacks, "
-    "what the code/law says).\n"
+    "city services, news, events, FAQs, general how-to questions, AND how to apply for or "
+    "pay for a permit, what documents are needed, and Building & Safety info.\n"
+    "- permit: looking up SPECIFIC existing permit records, permit status, or counts of "
+    "permits, e.g. 'permit history for 150 N Third St' or 'how many solar permits in "
+    "December'. Use ONLY for existing permit records, NOT for how to apply.\n"
+    "- codes: the municipal code text, ordinances, or regulations themselves (zoning, "
+    "setbacks, what the code/law says).\n"
     "If you are unsure, answer website."
 )
 
