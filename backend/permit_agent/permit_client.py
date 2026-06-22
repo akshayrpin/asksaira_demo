@@ -55,6 +55,27 @@ _FACET_FIELDS = {"type", "status", "department", "zone", "city", "module"}
 _STOP = {"the", "and", "for", "permit", "permits", "to", "of", "in", "a", "my", "new", "at", "is"}
 _FUZZY_FLOOR = 0.6  # below this, a fuzzy candidate is treated as no match
 
+# Common acronyms / synonyms that letter-matching alone can't resolve (e.g. "ADU" is
+# not a substring of "Accessory Dwelling Unit"). Acronyms that ARE the initials of a
+# type (CUP, TI, ...) are handled generically by the acronym tier, so they're not listed.
+_ALIASES = {
+    "adu": "accessory dwelling unit",
+    "granny flat": "accessory dwelling unit",
+    "in-law unit": "accessory dwelling unit",
+    "sfr": "single-family",
+    "sfd": "single-family",
+}
+
+
+def _initials(value):
+    """First letter of each word, lowercased: 'Accessory Dwelling Unit' -> 'adu'."""
+    return "".join(w[0] for w in re.findall(r"[A-Za-z]+", value)).lower()
+
+
+def _has_word(text, word):
+    """True if `word` appears as a whole word in `text` (so 'ti' doesn't match 'activity')."""
+    return re.search(r"\b" + re.escape(word) + r"\b", text) is not None
+
 
 def _esc(token):
     """Keep only alphanumerics so a token is safe inside a wildcard/term query."""
@@ -138,17 +159,28 @@ async def find_permit_type(keyword):
     say 'I couldn't find that type' instead of guessing.
     """
     types = await _all_types()
-    raw = [w.lower() for w in str(keyword).split()]
-    words = [w for w in raw if len(w) >= 4 and w not in _STOP] or raw
+    low = str(keyword).strip().lower()
+    low = _ALIASES.get(low, low)  # expand a known acronym/synonym first
+    raw = low.split()
+    words = [w for w in raw if w not in _STOP] or raw
 
-    allm = [(v, c) for v, c in types if all(w in v.lower() for w in words)]
+    # 1) every keyword word present as a whole word
+    allm = [(v, c) for v, c in types if all(_has_word(v.lower(), w) for w in words)]
     if allm:
         return [{"value": v, "count": c} for v, c in allm[:8]]
 
+    # 2) any meaningful word (>=4 chars) present as a whole word
     big = [w for w in words if len(w) >= 4]
-    anym = [(v, c) for v, c in types if any(w in v.lower() for w in big)] if big else []
+    anym = [(v, c) for v, c in types if any(_has_word(v.lower(), w) for w in big)] if big else []
     if anym:
         return [{"value": v, "count": c} for v, c in anym[:8]]
+
+    # acronym tier: a single short token (e.g. "CUP", "TI") -> a type's word-initials
+    ak = re.sub(r"[^a-z]", "", low)
+    if " " not in low and 2 <= len(ak) <= 5:
+        acro = [(v, c) for v, c in types if _initials(v) == ak]
+        if acro:
+            return [{"value": v, "count": c} for v, c in acro[:8]]
 
     key = " ".join(words)
     scored = [(v, c, difflib.SequenceMatcher(None, key, v.lower()).ratio()) for v, c in types]
