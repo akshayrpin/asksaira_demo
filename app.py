@@ -36,6 +36,13 @@ from backend.utils import (
     format_pf_non_streaming_response,
 )
 
+import time
+try:
+    from backend.permit_agent import agent as permit_agent
+except Exception:  # missing aiohttp etc. -> feature simply stays off
+    permit_agent = None
+    logging.exception("permit agent unavailable; permit questions fall back to RAG")
+
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
@@ -413,13 +420,83 @@ async def classify_domain(user_query, client):
 
 
 async def route_index(user_query, client):
-    """Map the classified domain to an index name, or None to keep the default (website)."""
+    """Map the classified domain to an index name, or None to keep the default (website).
+
+    When the permit AGENT is on, permit questions are handled by it (live records),
+    not by a RAG index, so this only routes codes here.
+    """
     domain = await classify_domain(user_query, client)
-    if domain == "permit":
+    if domain == "permit" and not PERMIT_AGENT_ENABLED:
         return PERMITS_INDEX
     if domain == "codes":
         return CODES_INDEX
     return None
+
+
+# --- Permit agent: answer existing-permit questions from the live records ---------
+# Opt-in (askburbanktest only for now). When on, a question the classifier tags as
+# 'permit' is answered by the read-permits agent (counts/lists/lookups over the permits
+# index) instead of RAG. Everything else (website, codes) is unchanged.
+PERMIT_AGENT_ENABLED = bool(permit_agent) and os.environ.get("PERMIT_AGENT_ENABLED", "0") != "0"
+
+
+def _latest_user_query(messages):
+    return next(
+        (m["content"] for m in reversed(messages)
+         if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        None,
+    )
+
+
+async def try_permit_answer(request_body):
+    """If the latest question is a permit-records question, answer it from the live
+    permits index and return the answer string. Otherwise return None (run normal RAG)."""
+    if not PERMIT_AGENT_ENABLED:
+        return None
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    user_query = _latest_user_query(messages)
+    if not user_query:
+        return None
+    try:
+        client = await init_openai_client()
+        if await classify_domain(user_query, client) != "permit":
+            return None
+        logging.info("[PERMIT AGENT] handling: %s", user_query)
+        return await permit_agent.answer_permit_query(user_query, client, app_settings.azure_openai.model)
+    except Exception:
+        logging.exception("permit agent failed; falling back to RAG")
+        return None
+
+
+def _permit_message_obj():
+    return {
+        "id": "permit-agent",
+        "model": app_settings.azure_openai.model,
+        "created": int(time.time()),
+        "object": "extensions.chat.completion",
+        "choices": [{"messages": []}],
+    }
+
+
+def permit_non_streaming_response(answer, history_metadata):
+    """Shape a permit answer exactly like format_non_streaming_response output."""
+    obj = _permit_message_obj()
+    obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
+    obj["history_metadata"] = history_metadata
+    obj["apim-request-id"] = "permit-agent"
+    return obj
+
+
+def permit_stream_response(answer, history_metadata):
+    """A one-chunk async stream shaped like format_stream_response output."""
+    async def generate():
+        obj = _permit_message_obj()
+        obj["object"] = "extensions.chat.completion.chunk"
+        obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
+        obj["history_metadata"] = history_metadata
+        obj["apim-request-id"] = "permit-agent"
+        yield obj
+    return generate()
 
 
 async def send_chat_request(request_body, request_headers):
@@ -476,14 +553,20 @@ async def complete_chat_request(request_body, request_headers):
             app_settings.promptflow.citations_field_name
         )
     else:
-        response, apim_request_id = await send_chat_request(request_body, request_headers)
         history_metadata = request_body.get("history_metadata", {})
+        permit_answer = await try_permit_answer(request_body)
+        if permit_answer is not None:
+            return permit_non_streaming_response(permit_answer, history_metadata)
+        response, apim_request_id = await send_chat_request(request_body, request_headers)
         return format_non_streaming_response(response, history_metadata, apim_request_id)
 
 
 async def stream_chat_request(request_body, request_headers):
-    response, apim_request_id = await send_chat_request(request_body, request_headers)
     history_metadata = request_body.get("history_metadata", {})
+    permit_answer = await try_permit_answer(request_body)
+    if permit_answer is not None:
+        return permit_stream_response(permit_answer, history_metadata)
+    response, apim_request_id = await send_chat_request(request_body, request_headers)
     
     async def generate():
         context_logged = False
