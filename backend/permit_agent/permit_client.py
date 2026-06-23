@@ -34,6 +34,12 @@ PERMITS_API_BASE = os.environ.get(
 )
 TIMEOUT = 25
 
+# The agent only ever surfaces permits in these (granted) statuses. Applied to EVERY query
+# in _query, so counts, lists, breakdowns, type resolution, and single-permit lookups are
+# all restricted to them. "Permit Reissued" has no records today but is kept for the future.
+ALLOWED_STATUSES = ["Permit Final", "Permit Issued", "Permit Reissued", "Approved", "Issued"]
+_STATUS_FILTER = "status:(" + " OR ".join(f'"{s}"' for s in ALLOWED_STATUSES) + ")"
+
 # Fields a user actually cares about, kept small so tool results stay cheap.
 _SUMMARY = ["act_nbr", "type", "status", "department", "address",
             "applied_date", "valuation_calculated", "description"]
@@ -137,7 +143,8 @@ def _fqs(type=None, status=None, department=None, module=None, address=None,
 
 
 async def _query(params, facet=None):
-    qp = list(params) + [("wt", "json")]
+    # status whitelist applied to every request; ANDs with any other fq filters
+    qp = list(params) + [("wt", "json"), ("fq", _STATUS_FILTER)]
     if facet is not None:
         qp.append(("json.facet", json.dumps(facet)))
     async with aiohttp.ClientSession() as session:
