@@ -796,6 +796,58 @@ def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None,
         raise Exception(f"Error getting embeddings with endpoint={endpoint} with error={e}")
 
 
+# FAQ pages: keep each question with its answer. A fixed-size splitter cuts FAQ lists
+# mid-pair (question in one chunk, answer in the next), so retrieval can return a question
+# without its answer. We instead split at question boundaries and pack whole Q&A pairs.
+FAQ_MAX_TOKENS = 8000  # cap for keeping an unparseable FAQ page as a single chunk
+
+
+def _is_faq_question_line(line: str) -> bool:
+    """A line that introduces an FAQ question: a markdown heading, a bold line, or a short
+    standalone line, in each case ending with '?'."""
+    s = line.strip()
+    core = re.sub(r"^#{1,6}\s*", "", s)
+    core = re.sub(r"^\*\*(.+?)\*\*$", r"\1", core).strip()
+    if not core.endswith("?"):
+        return False
+    if re.match(r"^#{1,6}\s", s):                                      # heading question
+        return True
+    if re.match(r"^\*\*.+\*\*$", s):                                   # bold question
+        return True
+    if len(core) <= 160 and not s.startswith(("*", "-", "|", "[", "!")):  # short plain line
+        return True
+    return False
+
+
+def _split_faq_pairs(content: str, num_tokens: int) -> Optional[List[str]]:
+    """Split an FAQ page at question boundaries and pack whole question+answer segments into
+    chunks up to num_tokens, never splitting within a Q&A pair. Returns None when the page
+    has fewer than 2 detectable questions, so the caller can fall back."""
+    lines = content.splitlines()
+    bounds = [i for i, l in enumerate(lines) if _is_faq_question_line(l)]
+    if len(bounds) < 2:
+        return None
+    segments = []
+    if bounds[0] > 0:
+        segments.append("\n".join(lines[:bounds[0]]))                 # preamble (nav), isolated
+    for k, b in enumerate(bounds):
+        end = bounds[k + 1] if k + 1 < len(bounds) else len(lines)
+        segments.append("\n".join(lines[b:end]))                      # one question + its answer
+    chunks: List[str] = []
+    cur = ""
+    for seg in segments:
+        if not cur:
+            cur = seg
+        elif TOKEN_ESTIMATOR.estimate_tokens(cur + "\n" + seg) <= num_tokens:
+            cur = cur + "\n" + seg
+        else:
+            chunks.append(cur)
+            cur = seg
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def chunk_content_helper(
         content: str, file_format: str, file_name: Optional[str],
         token_overlap: int,
@@ -811,7 +863,18 @@ def chunk_content_helper(
     if doc_content_size < num_tokens or file_format in ["png", "jpg", "jpeg", "gif", "webp"]:
         yield doc.content, doc_content_size, doc
     else:
-        if file_format == "markdown":
+        is_faq = bool(file_name and re.search(r"faq|frequently[-_ ]?asked", file_name, re.IGNORECASE))
+        faq_chunks = _split_faq_pairs(content, num_tokens) if is_faq else None
+        if faq_chunks is not None:
+            # FAQ with detectable questions: each chunk holds whole Q&A pairs, none split.
+            for chunked_content in faq_chunks:
+                chunk_doc = parser.parse(chunked_content, file_name=file_name)
+                chunk_doc.title = doc.title
+                yield chunk_doc.content, TOKEN_ESTIMATOR.estimate_tokens(chunk_doc.content), chunk_doc
+        elif is_faq and doc_content_size < FAQ_MAX_TOKENS:
+            # FAQ with no detectable question markers: keep the whole page as one chunk.
+            yield doc.content, doc_content_size, doc
+        elif file_format == "markdown":
             splitter = MarkdownTextSplitter.from_tiktoken_encoder(
                 chunk_size=num_tokens, chunk_overlap=token_overlap)
             chunked_content_list = splitter.split_text(

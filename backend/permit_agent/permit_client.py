@@ -201,8 +201,27 @@ async def find_permit_type(keyword):
 
 # ------------------------------- public API -------------------------------
 
+async def _resolve_type(t):
+    """Map a permit-kind string to the exact stored type value when it isn't one already.
+
+    Guards against the model passing an abbreviation/typo straight into a filter (e.g.
+    'ADU' instead of 'Accessory Dwelling Unit'), which an exact-match field would score 0.
+    Only resolves when there is exactly ONE confident match; ambiguous inputs (e.g. 'pool',
+    which maps to several types) are left unchanged for the agent to disambiguate.
+    """
+    if not t:
+        return t
+    known = {v for v, _ in await _all_types()}
+    if t in known:
+        return t
+    m = await find_permit_type(t)
+    return m[0]["value"] if len(m) == 1 else t
+
+
 async def count(group_by=None, **filters):
     """Exact count of permits matching the filters, plus an optional grouped breakdown."""
+    if filters.get("type"):
+        filters["type"] = await _resolve_type(filters["type"])
     qp = [("q", "*"), ("rows", "0")] + _fqs(**filters)
     facet = None
     if group_by:
@@ -218,6 +237,8 @@ async def count(group_by=None, **filters):
 
 async def search(query=None, limit=12, **filters):
     """A page of matching permits. Returns the true total plus up to `limit` summaries."""
+    if filters.get("type"):
+        filters["type"] = await _resolve_type(filters["type"])
     limit = max(1, min(int(limit or 12), 50))
     if query:
         toks = [_esc(t) for t in str(query).split() if _esc(t)]

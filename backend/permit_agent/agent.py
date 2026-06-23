@@ -140,12 +140,19 @@ def _system_prompt():
     )
 
 
-async def answer_permit_query(user_query, client, model):
-    """Run the tool loop and return the agent's final text answer."""
-    messages = [
-        {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": user_query},
-    ]
+async def answer_permit_query(user_query, client, model, history=None):
+    """Run the tool loop and return the agent's final text answer.
+
+    `history` is the recent user/assistant turns (ending with the current question), so a
+    follow-up like "at what locations?" is answered in the context of the prior question.
+    """
+    if history:
+        messages = [{"role": "system", "content": _system_prompt()}] + history
+    else:
+        messages = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": user_query},
+        ]
     for _ in range(MAX_STEPS):
         resp = await client.chat.completions.create(
             model=model, messages=messages, tools=TOOLS, temperature=0,

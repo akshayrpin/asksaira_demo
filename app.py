@@ -401,17 +401,27 @@ ROUTER_SYSTEM_MESSAGE = (
 )
 
 
-async def classify_domain(user_query, client):
-    """Return 'website' | 'permit' | 'codes' for a question. Defaults to website on any failure."""
+async def classify_domain(user_query, client, history=None):
+    """Return 'website' | 'permit' | 'codes' for a question. Defaults to website on any failure.
+
+    If `history` (recent user/assistant turns, ending with the current question) is given,
+    the classifier sees it so a short follow-up like 'at what locations?' inherits the topic
+    of the previous turn instead of being misread as a generic website question."""
     if not user_query:
         return "website"
+    if history:
+        system = ROUTER_SYSTEM_MESSAGE + (
+            "\nThis is a multi-turn chat. Classify the user's MOST RECENT message, using the "
+            "earlier turns only as context. A short follow-up ('at what locations?', 'and in "
+            "2024?', 'what about commercial?') inherits the topic of the previous question.")
+        convo = [{"role": "system", "content": system}] + history
+    else:
+        convo = [{"role": "system", "content": ROUTER_SYSTEM_MESSAGE},
+                 {"role": "user", "content": user_query}]
     try:
         resp = await client.chat.completions.create(
             model=app_settings.azure_openai.model,
-            messages=[
-                {"role": "system", "content": ROUTER_SYSTEM_MESSAGE},
-                {"role": "user", "content": user_query},
-            ],
+            messages=convo,
             temperature=0,
             max_tokens=5,
         )
@@ -455,6 +465,14 @@ def _latest_user_query(messages):
     )
 
 
+def _recent_history(messages, turns=6, max_chars=700):
+    """Last few user/assistant turns (content trimmed), so the classifier and the agent
+    have conversation context for follow-up questions. Ends with the current question."""
+    recent = [m for m in messages
+              if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+    return [{"role": m["role"], "content": m["content"][:max_chars]} for m in recent[-turns:]]
+
+
 async def try_permit_answer(request_body):
     """If the latest question is a permit-records question, answer it from the live
     permits index and return the answer string. Otherwise return None (run normal RAG)."""
@@ -466,10 +484,12 @@ async def try_permit_answer(request_body):
         return None
     try:
         client = await init_openai_client()
-        if await classify_domain(user_query, client) != "permit":
+        history = _recent_history(messages)
+        if await classify_domain(user_query, client, history=history) != "permit":
             return None
         logging.info("[PERMIT AGENT] handling: %s", user_query)
-        return await permit_agent.answer_permit_query(user_query, client, app_settings.azure_openai.model)
+        return await permit_agent.answer_permit_query(
+            user_query, client, app_settings.azure_openai.model, history=history)
     except Exception:
         logging.exception("permit agent failed; falling back to RAG")
         return None
