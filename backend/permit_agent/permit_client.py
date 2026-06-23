@@ -117,10 +117,19 @@ def _fqs(type=None, status=None, department=None, module=None, address=None,
     if module:
         out.append(("fq", f'module:"{module}"'))
     if address:
-        for tok in str(address).upper().split():
-            t = _esc(tok)
-            if t:
-                out.append(("fq", f"address:*{t}*"))
+        # Match by whole token, not substring, so "30 Elm" doesn't pull in "230" or
+        # "Elmwood". A leading house number is anchored at the start ("30 *"); every other
+        # token must be bounded by a space on the left and a space OR end-of-string on the
+        # right ("* THIRD *" OR "* THIRD"). The end-of-string alternative means we assume
+        # nothing about trailing format, so this holds for other indexes too. Whole-token
+        # matching also pulls in unit sub-addresses ("201 E MAGNOLIA BLVD 145"), which a
+        # plain exact match would miss.
+        toks = [t for t in (_esc(x) for x in str(address).upper().split()) if t]
+        for i, t in enumerate(toks):
+            if i == 0 and t.isdigit():
+                out.append(("fq", f"address:{t}\\ *"))
+            else:
+                out.append(("fq", f"address:(*\\ {t}\\ * OR *\\ {t})"))
     if date_from or date_to:
         f = _date_field(date_field)
         out.append(("fq", f"{f}:[{_solr_dt(date_from)} TO {_solr_dt(date_to, end=True)}]"))

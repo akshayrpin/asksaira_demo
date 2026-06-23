@@ -60,6 +60,7 @@ TOOLS = [
                     "department": {"type": "string"},
                     "module": {"type": "string", "enum": ["BUSINESS TAX", "BUSINESS LICENSE", "BUILDING", "PUBLIC WORKS", "CODE ENFORCEMENT", "PLANNING", "PARKING", "HOUSING"],
                                "description": "high-level category; use 'BUSINESS TAX' for new businesses, 'BUSINESS LICENSE' for business licenses"},
+                    "address": {"type": "string", "description": "street address to restrict the count to, e.g. '123 Main St'"},
                     "date_field": {"type": "string", "enum": ["applied", "issued", "final", "updated", "created"]},
                     "date_from": {"type": "string", "description": "YYYY-MM-DD / YYYY-MM / YYYY"},
                     "date_to": {"type": "string", "description": "YYYY-MM-DD / YYYY-MM / YYYY"},
@@ -110,7 +111,7 @@ async def _dispatch(name, args):
     if name == "count_permits":
         return await pc.count(
             type=args.get("type"), status=args.get("status"), department=args.get("department"),
-            module=args.get("module"),
+            module=args.get("module"), address=args.get("address"),
             date_field=args.get("date_field", "applied"),
             date_from=args.get("date_from"), date_to=args.get("date_to"),
             group_by=args.get("group_by"),
