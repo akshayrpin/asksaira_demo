@@ -27,6 +27,7 @@ Today is {today}.
 How to work:
 - When the user names a kind of permit in words (e.g. "solar", "ADU", "pool", "electrical"), call find_permit_type FIRST to get the exact stored type value, then use that exact value in count_permits / search_permits. If find_permit_type returns nothing, tell the user you couldn't find that permit type and ask them to rephrase; do NOT guess a type.
 - "how many ..." -> count_permits. "show / list / which permits ..." or anything tied to an address -> search_permits. A specific permit number (like BS2504744) -> get_permit.
+- Business questions use the module filter, NOT find_permit_type (a business isn't a single permit type). For "new businesses" / "businesses opened" / "business tax", use module="BUSINESS TAX". For "business license(s)", use module="BUSINESS LICENSE". "Opened/registered" means applied (use date_field "applied").
 - Dates: default date_field is "applied" (filed/submitted). Use "issued" for issued/approved, "final" for completed/finaled. For "this month" use {month_start} to {month_end}; for "this year" use {year}-01-01 to {year}-12-31. Pass dates as YYYY-MM-DD.
 - search_permits returns up to 12 records plus the true total. When you list them, show those (address, type, status, date) and then state the total, e.g. "Showing 12 of 47 permits at that address."
 - Use group_by on count_permits when the user wants a breakdown (by status, type, or department).
@@ -57,6 +58,8 @@ TOOLS = [
                     "type": {"type": "string", "description": "exact stored type value"},
                     "status": {"type": "string"},
                     "department": {"type": "string"},
+                    "module": {"type": "string", "enum": ["BUSINESS TAX", "BUSINESS LICENSE", "BUILDING", "PUBLIC WORKS", "CODE ENFORCEMENT", "PLANNING", "PARKING", "HOUSING"],
+                               "description": "high-level category; use 'BUSINESS TAX' for new businesses, 'BUSINESS LICENSE' for business licenses"},
                     "date_field": {"type": "string", "enum": ["applied", "issued", "final", "updated", "created"]},
                     "date_from": {"type": "string", "description": "YYYY-MM-DD / YYYY-MM / YYYY"},
                     "date_to": {"type": "string", "description": "YYYY-MM-DD / YYYY-MM / YYYY"},
@@ -76,6 +79,8 @@ TOOLS = [
                     "address": {"type": "string", "description": "street address to match"},
                     "type": {"type": "string", "description": "exact stored type value"},
                     "status": {"type": "string"},
+                    "module": {"type": "string", "enum": ["BUSINESS TAX", "BUSINESS LICENSE", "BUILDING", "PUBLIC WORKS", "CODE ENFORCEMENT", "PLANNING", "PARKING", "HOUSING"],
+                               "description": "high-level category; 'BUSINESS TAX' for businesses, 'BUSINESS LICENSE' for business licenses"},
                     "query": {"type": "string", "description": "free-text keywords (applicant name, etc.)"},
                     "date_field": {"type": "string", "enum": ["applied", "issued", "final", "updated", "created"]},
                     "date_from": {"type": "string"},
@@ -105,6 +110,7 @@ async def _dispatch(name, args):
     if name == "count_permits":
         return await pc.count(
             type=args.get("type"), status=args.get("status"), department=args.get("department"),
+            module=args.get("module"),
             date_field=args.get("date_field", "applied"),
             date_from=args.get("date_from"), date_to=args.get("date_to"),
             group_by=args.get("group_by"),
@@ -112,7 +118,7 @@ async def _dispatch(name, args):
     if name == "search_permits":
         return await pc.search(
             query=args.get("query"), address=args.get("address"),
-            type=args.get("type"), status=args.get("status"),
+            type=args.get("type"), status=args.get("status"), module=args.get("module"),
             date_field=args.get("date_field", "applied"),
             date_from=args.get("date_from"), date_to=args.get("date_to"),
             limit=12,

@@ -104,7 +104,7 @@ def _solr_dt(d, end=False):
     return d  # assume already a full datetime
 
 
-def _fqs(type=None, status=None, department=None, address=None,
+def _fqs(type=None, status=None, department=None, module=None, address=None,
          date_field="applied", date_from=None, date_to=None):
     """Build the list of ('fq', clause) tuples for the given filters."""
     out = []
@@ -114,6 +114,8 @@ def _fqs(type=None, status=None, department=None, address=None,
         out.append(("fq", f'status:"{status}"'))
     if department:
         out.append(("fq", f'department:"{department}"'))
+    if module:
+        out.append(("fq", f'module:"{module}"'))
     if address:
         for tok in str(address).upper().split():
             t = _esc(tok)
