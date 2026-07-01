@@ -598,7 +598,11 @@ async def try_apply_answer(request_body):
     if not PERMIT_APPLY_ENABLED:
         return None
     raw = request_body.get("messages", [])
-    history = _recent_history(raw)  # user/assistant only; the tag tool-message is excluded
+    # The apply agent re-reads the collected fields from the history each turn, so it needs
+    # the WHOLE application, not just the last few turns (else early fields like name/email
+    # scroll out of the window and it re-asks). ~30 messages covers a full field-by-field
+    # application with slack; the classifier keeps the small window (it only needs recent context).
+    history = _recent_history(raw, turns=30)  # user/assistant only; tag tool-message excluded
     user_query = _latest_user_query(raw)
     if not user_query:
         return None

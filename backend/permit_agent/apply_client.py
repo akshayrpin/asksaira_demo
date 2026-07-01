@@ -13,6 +13,7 @@ payment stays a hosted link.
 
 import hashlib
 import os
+import re
 import time
 
 import aiohttp
@@ -77,8 +78,9 @@ def _real(m):
 
 
 def _norm(s):
-    """Uppercase + collapse whitespace so '5865 Los Nietos St' ~ '5865  LOS NIETOS STREET '."""
-    return " ".join(str(s or "").upper().split())
+    """Uppercase, drop punctuation, collapse whitespace, so '5865, Los Nietos St.' matches
+    '5865  LOS NIETOS STREET '. Users type commas/periods that the stored data doesn't have."""
+    return " ".join(re.sub(r"[.,;]", " ", str(s or "")).upper().split())
 
 
 _all_addr = {"list": None}
