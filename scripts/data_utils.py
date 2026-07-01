@@ -807,6 +807,7 @@ def _is_faq_question_line(line: str) -> bool:
     standalone line, in each case ending with '?'."""
     s = line.strip()
     core = re.sub(r"^#{1,6}\s*", "", s)
+    core = re.sub(r"\s*\{#[^}]*\}\s*$", "", core)        # strip trailing {#anchor} tags
     core = re.sub(r"^\*\*(.+?)\*\*$", r"\1", core).strip()
     if not core.endswith("?"):
         return False

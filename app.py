@@ -37,11 +37,17 @@ from backend.utils import (
 )
 
 import time
+import datetime
 try:
     from backend.permit_agent import agent as permit_agent
 except Exception:  # missing aiohttp etc. -> feature simply stays off
     permit_agent = None
     logging.exception("permit agent unavailable; permit questions fall back to RAG")
+try:
+    from backend.permit_agent import apply_agent
+except Exception:  # missing deps -> apply flow simply stays off
+    apply_agent = None
+    logging.exception("apply agent unavailable; instant-permit flow disabled")
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -245,7 +251,8 @@ def prepare_model_args(request_body, request_headers):
         messages = [
             {
                 "role": "system",
-                "content": app_settings.azure_openai.system_message
+                "content": f"Today's date is {datetime.date.today().isoformat()}. "
+                + app_settings.azure_openai.system_message
             }
         ]
 
@@ -294,6 +301,13 @@ def prepare_model_args(request_body, request_headers):
                 )
             ]
         }
+        # Stamp today's date into the system prompt (role_information) so the model can
+        # reason about "next / upcoming / recent / this year" instead of treating an old
+        # indexed date as current. The env-var system message stays the static base text.
+        _params = model_args["extra_body"]["data_sources"][0].get("parameters", {})
+        for _k in ("role_information", "roleInformation"):
+            if _params.get(_k):
+                _params[_k] = f"Today's date is {datetime.date.today().isoformat()}. " + _params[_k]
 
     model_args_clean = copy.deepcopy(model_args)
     if model_args_clean.get("extra_body"):
@@ -381,11 +395,15 @@ INDEX_ROUTING_ENABLED = bool(PERMITS_INDEX and CODES_INDEX)
 
 ROUTER_SYSTEM_MESSAGE = (
     "You route a resident's question for a city government assistant to ONE data source. "
-    "Reply with exactly one lowercase word: website, permit, or codes.\n"
+    "Reply with exactly one lowercase word: website, permit, instant-permit, or codes.\n"
     "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
     "city services, news, events, FAQs, general how-to questions, AND how to apply for or "
     "pay for a permit, permit fees, what documents are needed, which permit you need for a "
     "project, what permit types the city offers in general, and Building & Safety info.\n"
+    "- instant-permit: the user wants to ACTUALLY APPLY for / start / file / submit a permit "
+    "application right now (e.g. 'I want to apply for a solar permit', 'help me file a solar "
+    "permit', 'start my permit application'). This is the transactional apply flow, NOT a "
+    "how-to question (website) and NOT looking up existing records (permit).\n"
     "- permit: looking up SPECIFIC existing permit records, their status, or any COUNT, "
     "BREAKDOWN, LIST, or RANKING of permits actually filed or issued (this also covers "
     "business tax registrations and business licenses). Includes breakdowns by type, "
@@ -429,6 +447,8 @@ async def classify_domain(user_query, client, history=None):
     except Exception:
         logging.exception("Domain classifier failed; defaulting to website")
         return "website"
+    if "instant" in label:          # check before "permit" ('instant-permit' contains it)
+        return "instant-permit"
     if "permit" in label:
         return "permit"
     if "code" in label:
@@ -436,13 +456,13 @@ async def classify_domain(user_query, client, history=None):
     return "website"
 
 
-async def route_index(user_query, client):
-    """Map the classified domain to an index name, or None to keep the default (website).
+def index_for_domain(domain):
+    """Map an ALREADY-classified domain to a scoped index name, or None to keep the default
+    (website). No LLM call here; the domain was classified once via _domain_for and reused.
 
-    When the permit AGENT is on, permit questions are handled by it (live records),
-    not by a RAG index, so this only routes codes here.
+    When the permit AGENT is on, permit questions are handled by it (live records), not a
+    RAG index, so only codes reroutes here.
     """
-    domain = await classify_domain(user_query, client)
     if domain == "permit" and not PERMIT_AGENT_ENABLED:
         return PERMITS_INDEX
     if domain == "codes":
@@ -473,6 +493,23 @@ def _recent_history(messages, turns=6, max_chars=700):
     return [{"role": m["role"], "content": m["content"][:max_chars]} for m in recent[-turns:]]
 
 
+async def _domain_for(request_body, client):
+    """Classify the latest question ONCE per request and cache it on request_body.
+
+    The apply, permit, and index-routing deciders all ask the same 'what domain is this?'
+    question, so we run the classifier LLM once and every consumer reuses the cached word.
+    (Mid-flow apply turns short-circuit before this, so they classify zero times.)"""
+    if "_domain" in request_body:
+        return request_body["_domain"]
+    raw = request_body.get("messages", [])
+    user_query = _latest_user_query(raw)
+    domain = "website"
+    if user_query:
+        domain = await classify_domain(user_query, client, history=_recent_history(raw))
+    request_body["_domain"] = domain
+    return domain
+
+
 async def try_permit_answer(request_body):
     """If the latest question is a permit-records question, answer it from the live
     permits index and return the answer string. Otherwise return None (run normal RAG)."""
@@ -485,7 +522,7 @@ async def try_permit_answer(request_body):
     try:
         client = await init_openai_client()
         history = _recent_history(messages)
-        if await classify_domain(user_query, client, history=history) != "permit":
+        if await _domain_for(request_body, client) != "permit":
             return None
         logging.info("[PERMIT AGENT] handling: %s", user_query)
         return await permit_agent.answer_permit_query(
@@ -526,6 +563,95 @@ def permit_stream_response(answer, history_metadata):
     return generate()
 
 
+# --- Instant-permit APPLY flow (multi-turn, in the chat UI) -----------------------
+# Opt-in. State lives entirely in the conversation history (the apply LLM re-reads the
+# collected fields each turn). A hidden tag in the assistant turn's `context` marks that
+# we're mid-flow, so cheap code can skip the classifier while an application is in progress.
+PERMIT_APPLY_ENABLED = bool(apply_agent) and os.environ.get("PERMIT_APPLY_ENABLED", "0") != "0"
+APPLY_FLOW = "instant-permit"  # the tag value; rides in a `context` -> `tool` message
+
+
+def _apply_flow_active(messages):
+    """True if the MOST RECENT bot turn carried the apply tag. The frontend replays the
+    tag as a `tool` message sitting just before the assistant message, so we find the last
+    assistant message and check the tool message right before it. Older tags don't count,
+    only the last turn, so once the flow ends (no tag emitted) we correctly fall out."""
+    idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            idx = i
+            break
+    if idx is None:
+        return False
+    prev = messages[idx - 1] if idx > 0 else None
+    if not prev or prev.get("role") != "tool":
+        return False
+    try:
+        return json.loads(prev.get("content") or "{}").get("flow") == APPLY_FLOW
+    except (ValueError, TypeError):
+        return False
+
+
+async def try_apply_answer(request_body):
+    """Drive the instant-permit apply flow. Returns None to fall through to normal routing,
+    otherwise {"reply": str, "in_flow": bool}. We skip the classifier when already mid-flow."""
+    if not PERMIT_APPLY_ENABLED:
+        return None
+    raw = request_body.get("messages", [])
+    history = _recent_history(raw)  # user/assistant only; the tag tool-message is excluded
+    user_query = _latest_user_query(raw)
+    if not user_query:
+        return None
+    try:
+        client = await init_openai_client()
+        if not _apply_flow_active(raw):
+            # not mid-flow -> classify once (cached for permit + index routing to reuse)
+            if await _domain_for(request_body, client) != "instant-permit":
+                return None
+            logging.info("[APPLY AGENT] entering flow: %s", user_query)
+        else:
+            logging.info("[APPLY AGENT] continuing flow (classifier skipped)")
+        result = await apply_agent.answer_apply_query(
+            history, client, app_settings.azure_openai.model)
+        if result.get("left"):        # user changed topic -> fall through, drop the tag
+            return None
+        return {"reply": result["reply"], "in_flow": result["in_flow"]}
+    except Exception:
+        logging.exception("apply agent failed; falling back to RAG")
+        return None
+
+
+def _apply_messages(reply, in_flow):
+    """Build choices[0].messages: a tag (tool) message first when in_flow, then the reply.
+    The tool message is how the flow tag round-trips (see _apply_flow_active)."""
+    msgs = []
+    if in_flow:
+        msgs.append({"role": "tool", "content": json.dumps({"flow": APPLY_FLOW})})
+    msgs.append({"role": "assistant", "content": reply})
+    return msgs
+
+
+def apply_non_streaming_response(reply, in_flow, history_metadata):
+    obj = _permit_message_obj()
+    obj["id"] = "apply-agent"
+    obj["choices"][0]["messages"] = _apply_messages(reply, in_flow)
+    obj["history_metadata"] = history_metadata
+    obj["apim-request-id"] = "apply-agent"
+    return obj
+
+
+def apply_stream_response(reply, in_flow, history_metadata):
+    async def generate():
+        obj = _permit_message_obj()
+        obj["id"] = "apply-agent"
+        obj["object"] = "extensions.chat.completion.chunk"
+        obj["choices"][0]["messages"] = _apply_messages(reply, in_flow)
+        obj["history_metadata"] = history_metadata
+        obj["apim-request-id"] = "apply-agent"
+        yield obj
+    return generate()
+
+
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -539,13 +665,11 @@ async def send_chat_request(request_body, request_headers):
     try:
         azure_openai_client = await init_openai_client()
 
-        # Route this question to the right scoped index (website stays default).
+        # Route this question to the right scoped index (website stays default). Reuse the
+        # single cached classification; only classifies here if nothing did so earlier.
         if INDEX_ROUTING_ENABLED and app_settings.datasource and model_args.get("extra_body"):
-            user_query = next(
-                (m["content"] for m in reversed(filtered_messages) if m.get("role") == "user"),
-                None,
-            )
-            routed_index = await route_index(user_query, azure_openai_client)
+            domain = await _domain_for(request_body, azure_openai_client)
+            routed_index = index_for_domain(domain)
             if routed_index:
                 model_args["extra_body"]["data_sources"][0]["parameters"]["index_name"] = routed_index
                 logging.info(f"[ROUTED INDEX] {routed_index}")
@@ -581,6 +705,9 @@ async def complete_chat_request(request_body, request_headers):
         )
     else:
         history_metadata = request_body.get("history_metadata", {})
+        apply_answer = await try_apply_answer(request_body)
+        if apply_answer is not None:
+            return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"], history_metadata)
         permit_answer = await try_permit_answer(request_body)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
@@ -590,6 +717,9 @@ async def complete_chat_request(request_body, request_headers):
 
 async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
+    apply_answer = await try_apply_answer(request_body)
+    if apply_answer is not None:
+        return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"], history_metadata)
     permit_answer = await try_permit_answer(request_body)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
