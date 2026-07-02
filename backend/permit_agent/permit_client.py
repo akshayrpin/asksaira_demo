@@ -142,9 +142,14 @@ def _fqs(type=None, status=None, department=None, module=None, address=None,
     return out
 
 
-async def _query(params, facet=None):
-    # status whitelist applied to every request; ANDs with any other fq filters
-    qp = list(params) + [("wt", "json"), ("fq", _STATUS_FILTER)]
+async def _query(params, facet=None, status_filter=True):
+    # The status whitelist is a PERMIT concept (only surface granted permits). Business-tax /
+    # license records use a different status vocabulary (Active, Paid/Current, Out of Business,
+    # ...), so callers targeting a business module pass status_filter=False, else those records
+    # would all be filtered out. See BUSINESS_MODULES.
+    qp = list(params) + [("wt", "json")]
+    if status_filter:
+        qp.append(("fq", _STATUS_FILTER))
     if facet is not None:
         qp.append(("json.facet", json.dumps(facet)))
     async with aiohttp.ClientSession() as session:

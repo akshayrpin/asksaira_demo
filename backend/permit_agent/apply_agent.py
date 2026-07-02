@@ -150,8 +150,12 @@ async def handle_submit(a, user_confirmed):
     if err:
         return err
     result = await api.add_permit(a)
-    return {"status": "submitted", "permitNumber": result.get("permitNumber"),
-            "mock": result.get("mock", False),
+    pn = result.get("permitNumber")
+    if not pn:  # the API rejected it (404/validation/etc.) -> do NOT claim success
+        return {"status": "submit_failed", "api_message": result.get("message"),
+                "message": "The permit could NOT be created. Tell the user the submission "
+                           "failed and to try again shortly; do not claim it succeeded."}
+    return {"status": "submitted", "permitNumber": pn, "mock": result.get("mock", False),
             "message": "Permit created. Tell the user the permit number and that they finish by paying the fee on the city portal."}
 
 

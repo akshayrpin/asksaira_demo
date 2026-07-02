@@ -147,5 +147,7 @@ async def add_permit(app):
             "peopleTypeId": PERMIT_CODES["applicant_peopleTypeId"], "title": "Applicant",
         }],
     }
+    # NOTE: the :6060 Buena Park sandbox endpoint is 'addSolarPermit'. The newer official
+    # :9080 API calls it 'addPermit' (with actTypeId) — switch this when we move to that base.
     async with aiohttp.ClientSession() as s:
-        return await _request(s, "POST", "addPermit", json_body=body)
+        return await _request(s, "POST", "addSolarPermit", json_body=body)
