@@ -374,7 +374,7 @@ export const Answer = ({ answer, onCitationClicked, onExectResultClicked }: Prop
             </Stack.Item>
           )}
         </Stack>
-        {chevronIsExpanded && (
+        { /*chevronIsExpanded*/ (
           <div className={styles.citationWrapper}>
             {parsedAnswer?.citations.map((citation, idx) => {
               if((citation.title != null && citation.title.includes("#")) || (citation.filepath != null && citation.filepath.includes("#"))) {
