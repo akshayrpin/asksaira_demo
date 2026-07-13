@@ -99,6 +99,7 @@ export const Answer = ({ answer, onCitationClicked, onExectResultClicked }: Prop
       url = url.replaceAll("U+7C", "|")
       url = url.replaceAll("#", "/")
       url = url.replaceAll(".html", "")
+      url = url.replaceAll(".md", "")
       url = "https://" + url
       citationFilename = url
     }
