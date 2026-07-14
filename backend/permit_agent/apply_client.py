@@ -20,7 +20,7 @@ import aiohttp
 
 BASE = os.environ.get(
     "PERMIT_APPLY_BASE",
-    "http://clients.edgesoftinc.com:6060/buenapark-symbium-api/APIController",
+    "http://clients.edgesoftinc.com:9080/askSairaApi/APIController",
 )
 USERNAME = os.environ.get("PERMIT_APPLY_USERNAME", "symbium")
 PASSWORD = os.environ.get("PERMIT_APPLY_PASSWORD", "symbium1")
@@ -29,16 +29,24 @@ TIMEOUT = 25
 # Force placeholder fee + submit with PERMIT_APPLY_MOCK=1 (also auto-mocks if codes blank).
 MOCK = os.environ.get("PERMIT_APPLY_MOCK", "0") != "0"
 
-# Permit codes confirmed against the sandbox: permitType SLR; subTypeId 6=residential,
-# 7=commercial; peopleTypeId 8 = applicant.
-PERMIT_CODES = {"permitType": "SLR", "subTypeIds": {"residential": 6, "commercial": 7},
-                "applicant_peopleTypeId": 8}
+# MEPP (Mechanical/Electrical/Plumbing) instant permits, confirmed against the :9080 API.
+# feeEstimate takes the string permitType "MEPP"; addPermit takes the integer actTypeId 1.
+# The subtype is the specific job the resident picks. peopleTypeId 2 = applicant (8 = owner).
+MEPP_SUBTYPES = {
+    1: "Mechanical - HVAC",
+    2: "Electrical - House Rewire",
+    3: "Electrical - Panel Upgrade",
+    4: "Plumbing - Water Heater Replacement",
+    5: "Plumbing - House Repipe",
+}
+PERMIT_CODES = {"permitType": "MEPP", "actTypeId": 1, "applicant_peopleTypeId": 2,
+                "owner_peopleTypeId": 8, "subtypes": MEPP_SUBTYPES}
 
 
 def use_mock():
     """Mock the fee + submit if asked to, or whenever the codes aren't filled yet."""
     codes = PERMIT_CODES
-    ready = codes.get("permitType") and codes.get("subTypeIds") and codes.get("applicant_peopleTypeId")
+    ready = codes.get("permitType") and codes.get("actTypeId") and codes.get("applicant_peopleTypeId")
     return MOCK or not ready
 
 
@@ -116,15 +124,45 @@ async def validate_address(address):
         return [a for a in addrs if _norm(a.get("address")).startswith(nq)][:5]
 
 
+async def search_addresses(query, limit=8):
+    """Type-ahead search for the address-autocomplete widget.
+
+    Prefix matches rank first (house-number-first, so '4755 guad' surfaces
+    '4755 GUADALAJARA WAY' at the top), then substring matches. Searches the once-cached
+    getAllAddresses list in memory, so it NEVER hits the slow permit API per keystroke.
+    Returns [{address, lsoId, apn}]; empty for queries under 2 chars. Selecting a result
+    hands the caller a guaranteed-valid lsoId, so no follow-up validateAddress is needed.
+    """
+    nq = _norm(query)
+    if len(nq) < 2:
+        return []
+    async with aiohttp.ClientSession() as s:
+        addrs = await _all_addresses(s)
+    prefix, contains = [], []
+    for a in addrs:
+        if not _real(a):
+            continue
+        na = _norm(a.get("address"))
+        if na.startswith(nq):
+            prefix.append(a)
+        elif nq in na:
+            contains.append(a)
+    prefix.sort(key=lambda a: _norm(a.get("address")))
+    contains.sort(key=lambda a: _norm(a.get("address")))
+    return [{"address": str(a.get("address")).strip(), "lsoId": a.get("lsoId"), "apn": a.get("apn")}
+            for a in (prefix + contains)[:limit]]
+
+
 async def fee_estimate(app):
-    """Estimate the permit fee. Placeholder when in mock mode."""
+    """Estimate the permit fee. Placeholder when in mock mode. feeEstimate uses the
+    string permitType ('MEPP') plus the picked subTypeId."""
     if use_mock():
-        return {"totalFee": 285.00, "feeDetails": [{"feeDescription": "Solar permit (placeholder)", "feeAmount": 285.00}],
+        return {"totalFee": 220.00, "feeDetails": [{"feeDescription": "MEPP permit (placeholder)", "feeAmount": 220.00}],
                 "mock": True}
     form = {
         "permitType": PERMIT_CODES["permitType"],
         "subTypeIds": [{"subTypeId": app["subTypeId"]}],
-        "unit": app["unit"], "noOfBatteries": app["noOfBatteries"],
+        "unit": app.get("unit", 1),
         "valuation": app["valuation"], "peopleId": app.get("peopleId", 0),
     }
     async with aiohttp.ClientSession() as s:
@@ -132,13 +170,15 @@ async def fee_estimate(app):
 
 
 async def add_permit(app):
-    """Create the permit. Placeholder when in mock mode. Returns {permitNumber, ...}."""
+    """Create the permit via addPermit (AddActivity). Placeholder when in mock mode.
+    Returns {permitNumber, ...}."""
     if use_mock():
         suffix = hashlib.sha1(app["property_address"].encode()).hexdigest()[:6].upper()
-        return {"permitNumber": f"SOLAR-MOCK-{suffix}", "status": True, "mock": True}
+        return {"permitNumber": f"MEPP-MOCK-{suffix}", "status": True, "mock": True}
     body = {
+        "actTypeId": PERMIT_CODES["actTypeId"],
         "description": app["description"], "lsoId": app["lsoId"],
-        "valuation": app["valuation"], "unit": app["unit"], "noOfBatteries": app["noOfBatteries"],
+        "valuation": app["valuation"], "unit": app.get("unit", 1),
         "subTypeIds": [{"subTypeId": app["subTypeId"]}],
         "people": [{
             "name": app["name"], "emailAddress": app["email"], "phoneNbr": app["phone"],
@@ -147,7 +187,5 @@ async def add_permit(app):
             "peopleTypeId": PERMIT_CODES["applicant_peopleTypeId"], "title": "Applicant",
         }],
     }
-    # NOTE: the :6060 Buena Park sandbox endpoint is 'addSolarPermit'. The newer official
-    # :9080 API calls it 'addPermit' (with actTypeId) — switch this when we move to that base.
     async with aiohttp.ClientSession() as s:
-        return await _request(s, "POST", "addSolarPermit", json_body=body)
+        return await _request(s, "POST", "addPermit", json_body=body)

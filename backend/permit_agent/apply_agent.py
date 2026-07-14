@@ -26,21 +26,31 @@ from backend.permit_agent import apply_client as api
 
 MAX_STEPS = 5
 
-SYSTEM = """You are the City of Burbank's instant solar-permit assistant, running inside a chat. You help someone apply for a solar permit (residential or commercial; panels, optionally batteries).
+# Friendly work-type -> MEPP subTypeId (mirrors apply_client.MEPP_SUBTYPES).
+WORK_TYPES = {
+    "HVAC": 1,
+    "House Rewire": 2,
+    "Panel Upgrade": 3,
+    "Water Heater Replacement": 4,
+    "House Repipe": 5,
+}
+
+SYSTEM = """You are the City of Buena Park's instant-permit assistant, running inside a chat. You help a resident file an over-the-counter permit for one of these jobs (MEPP): HVAC, House Rewire, Panel Upgrade, Water Heater Replacement, or House Repipe.
 
 Collect, asking for what's missing one or two items at a time (do not dump the whole list):
-- applicant name, email, phone
+- which job (one of the five work types above)
 - the property address where the work will be done
-- residential or commercial
-- estimated job cost (valuation), number of panels, number of batteries (0 if none)
-- a short description of the work
+- applicant name, email, phone
+- estimated job cost (valuation)
+- a short description of the work (if the user doesn't give one, default it to the job name, e.g. "Water heater replacement")
 
 Rules:
 - Use ONLY what the user tells you. Never invent a value.
+- Figure out the work type from what the user says (e.g. "my water heater broke" -> Water Heater Replacement). If it's unclear, ask which of the five.
 - As soon as the user gives the property address, call lookup_address to verify it. If not found, ask for a corrected address.
 - When every field is collected, call review_application (this shows the applicant a summary and the fee; it does NOT submit).
 - After the review is shown, the user must reply with the word CONFIRM to submit. When they do, call submit_application. Do not claim it is submitted yourself.
-- If at any point the user clearly stops applying and asks something unrelated (a different city question, a general question), call leave_flow so the assistant can hand them back to normal help. Do not force them to keep applying.
+- If at any point the user clearly stops applying and asks something unrelated, call leave_flow so the assistant can hand them back to normal help. Do not force them to keep applying.
 - Be concise and friendly."""
 
 TOOLS = [
@@ -54,25 +64,26 @@ TOOLS = [
         "description": "Validate all fields, resolve the address, compute the fee, and show the applicant a review. Does NOT submit. Call when every field is collected.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
-            "property_address": {"type": "string"}, "valuation": {"type": "number"},
-            "unit": {"type": "integer", "description": "number of panels"},
-            "noOfBatteries": {"type": "integer", "description": "0 if none"},
+            "property_address": {"type": "string"},
+            "work_type": {"type": "string", "enum": ["HVAC", "House Rewire", "Panel Upgrade",
+                          "Water Heater Replacement", "House Repipe"]},
+            "valuation": {"type": "number", "description": "estimated job cost in dollars"},
             "description": {"type": "string"},
-            "property_type": {"type": "string", "enum": ["residential", "commercial"]},
-        }, "required": ["name", "email", "phone", "property_address", "valuation", "unit",
-                        "noOfBatteries", "description", "property_type"]},
+        }, "required": ["name", "email", "phone", "property_address", "work_type",
+                        "valuation", "description"]},
     }},
     {"type": "function", "function": {
         "name": "submit_application",
         "description": "Submit the permit. Call ONLY after the review was shown and the user replied CONFIRM. Pass the same collected values.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
-            "property_address": {"type": "string"}, "valuation": {"type": "number"},
-            "unit": {"type": "integer"}, "noOfBatteries": {"type": "integer"},
+            "property_address": {"type": "string"},
+            "work_type": {"type": "string", "enum": ["HVAC", "House Rewire", "Panel Upgrade",
+                          "Water Heater Replacement", "House Repipe"]},
+            "valuation": {"type": "number"},
             "description": {"type": "string"},
-            "property_type": {"type": "string", "enum": ["residential", "commercial"]},
-        }, "required": ["name", "email", "phone", "property_address", "valuation", "unit",
-                        "noOfBatteries", "description", "property_type"]},
+        }, "required": ["name", "email", "phone", "property_address", "work_type",
+                        "valuation", "description"]},
     }},
     {"type": "function", "function": {
         "name": "leave_flow",
@@ -91,11 +102,8 @@ def _validate(a):
         errs.append("invalid email")
     if not isinstance(a.get("valuation"), (int, float)) or a.get("valuation", 0) <= 0:
         errs.append("valuation must be greater than 0")
-    for f in ["unit", "noOfBatteries"]:
-        if not isinstance(a.get(f), int) or a.get(f, -1) < 0:
-            errs.append(f"{f} must be a non-negative whole number")
-    if a.get("property_type") not in ("residential", "commercial"):
-        errs.append("property_type must be 'residential' or 'commercial'")
+    if a.get("work_type") not in WORK_TYPES:
+        errs.append("work_type must be one of: " + ", ".join(WORK_TYPES))
     return errs
 
 
@@ -110,7 +118,7 @@ async def _resolve(a):
                       "message": f"Could not find '{a['property_address']}'. Ask the user to re-check it."}
     prop = matches[0]
     a["lsoId"] = prop["lsoId"]
-    a["subTypeId"] = api.PERMIT_CODES["subTypeIds"][a["property_type"]]
+    a["subTypeId"] = WORK_TYPES[a["work_type"]]
     return prop, None
 
 
@@ -132,8 +140,8 @@ async def handle_review(a):
         "status": "review",
         "applicant": {"name": a["name"], "email": a["email"], "phone": a["phone"]},
         "property": str(prop["address"]).strip(),
-        "work": a["description"], "panels": a["unit"], "batteries": a["noOfBatteries"],
-        "valuation": a["valuation"], "type": a["property_type"],
+        "job": a["work_type"], "work": a["description"],
+        "valuation": a["valuation"],
         "fee": fee.get("totalFee"), "feeDetails": fee.get("feeDetails"),
         "mock": fee.get("mock", False),
         "message": "Show this review and the total fee, then ask the user to reply CONFIRM to submit.",
