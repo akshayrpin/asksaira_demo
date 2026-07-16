@@ -37,42 +37,28 @@ WORK_TYPES = {
 
 SYSTEM = """You are the City of Buena Park's instant-permit assistant, running inside a chat. You help a resident file an over-the-counter permit for one of these jobs (MEPP): HVAC, House Rewire, Panel Upgrade, Water Heater Replacement, or House Repipe.
 
-Collect, asking for what's missing one or two items at a time (do not dump the whole list):
-- which job (one of the five work types above)
-- the property address where the work will be done
-- applicant name, email, phone
-- estimated job cost (valuation)
-- a short description of the work (if the user doesn't give one, default it to the job name, e.g. "Water heater replacement")
+How you work, every single turn:
+1. FIRST call set_fields with EVERY value you have gathered from the whole conversation so far (omit what you don't have yet). Figure out the work type from the user's words (e.g. "my water heater broke" -> Water Heater Replacement). Use only what the user actually said; never invent a value.
+2. The tool result tells you what is still needed. Then write ONE short, friendly line asking for just that next item. Do NOT list all the fields, an on-screen widget handles the input, so keep your message to a single prompt.
 
-Rules:
-- Use ONLY what the user tells you. Never invent a value.
-- Figure out the work type from what the user says (e.g. "my water heater broke" -> Water Heater Replacement). If it's unclear, call show_widget("work_type") and add a one-line prompt so they can pick it.
-- When you need the property address, call show_widget("address") and add a one-line prompt so they can search and select it. Once they give an address, call lookup_address to verify it; if not found, ask for a corrected address.
-- To collect the applicant's name, email, phone and the estimated job cost together, call show_widget("contact") and add a one-line prompt. (Default the work description to the job name unless the user gives one.)
-- When every field is collected, call review_application (this shows the applicant a summary and the fee; it does NOT submit).
-- After the review is shown, the user must reply with the word CONFIRM to submit. When they do, call submit_application. Do not claim it is submitted yourself.
-- Instant online filing is available ONLY for those five jobs. If the user wants a permit that is NOT one of them (or says theirs isn't listed), do NOT call leave_flow. Reply briefly that instant online filing currently covers only those five job types (HVAC, House Rewire, Panel Upgrade, Water Heater Replacement, House Repipe), and for any other permit they can use the city's permit page or contact the permit office.
-- Only call leave_flow when the user clearly switches to an UNRELATED topic (a different city question, general chit-chat), never as a way to handle an unsupported permit type. Do not force them to keep applying.
+Other rules:
+- The system shows the review with the fee automatically once everything is collected. When it does, the user replies CONFIRM; then call submit_application with all the values. Never claim it is submitted yourself.
+- Instant online filing covers ONLY those five jobs. If the user wants a permit that is NOT one of them, briefly say instant filing covers only those five and point them to the city's permit page or the permit office. Do NOT call leave_flow for that.
+- Only call leave_flow if the user clearly switches to an UNRELATED topic.
 - Be concise and friendly."""
 
 TOOLS = [
     {"type": "function", "function": {
-        "name": "lookup_address",
-        "description": "Verify a property address against the city system. Call as soon as the user gives an address.",
-        "parameters": {"type": "object", "properties": {"address": {"type": "string"}}, "required": ["address"]},
-    }},
-    {"type": "function", "function": {
-        "name": "review_application",
-        "description": "Validate all fields, resolve the address, compute the fee, and show the applicant a review. Does NOT submit. Call when every field is collected.",
+        "name": "set_fields",
+        "description": "Call this on EVERY turn. Report every application value you have gathered from the whole conversation so far (omit what you don't have yet). The system uses it to decide what to ask next and which on-screen widget to show. After calling it, write only a short one-line prompt for the next item.",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
-            "property_address": {"type": "string"},
             "work_type": {"type": "string", "enum": ["HVAC", "House Rewire", "Panel Upgrade",
                           "Water Heater Replacement", "House Repipe"]},
+            "property_address": {"type": "string"},
+            "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
             "valuation": {"type": "number", "description": "estimated job cost in dollars"},
             "description": {"type": "string"},
-        }, "required": ["name", "email", "phone", "property_address", "work_type",
-                        "valuation", "description"]},
+        }},
     }},
     {"type": "function", "function": {
         "name": "submit_application",
@@ -92,40 +78,54 @@ TOOLS = [
         "description": "The user has stopped applying and asked something unrelated. Hand control back to normal help.",
         "parameters": {"type": "object", "properties": {}},
     }},
-    {"type": "function", "function": {
-        "name": "show_widget",
-        "description": "Surface a UI element for the next input instead of asking in plain text. 'work_type' = tappable job chips; 'address' = address search/select; 'contact' = a form for name, email, phone, and estimated job cost. Always add a short one-line prompt in your reply alongside it.",
-        "parameters": {"type": "object", "properties": {
-            "widget": {"type": "string", "enum": ["work_type", "address", "contact"]}},
-            "required": ["widget"]},
-    }},
+]
+
+# The four collected fields shown together as a form once work type + address are set.
+_CONTACT_FIELDS = [
+    {"name": "name", "label": "Full name"},
+    {"name": "email", "label": "Email", "inputType": "email"},
+    {"name": "phone", "label": "Phone", "inputType": "tel"},
+    {"name": "valuation", "label": "Estimated job cost ($)", "inputType": "number"},
 ]
 
 
-def _widget_for(name, args, result):
-    """Map a tool call to a UI widget payload the frontend renders. Returns None for tools
-    that don't drive UI. The fixed five: chips, address_autocomplete, form, review, result."""
-    if name == "show_widget":
-        if args.get("widget") == "work_type":
-            return {"type": "chips", "field": "work_type", "options": list(WORK_TYPES)}
-        if args.get("widget") == "address":
-            return {"type": "address_autocomplete", "field": "property_address"}
-        if args.get("widget") == "contact":
-            return {"type": "form", "field": "contact", "fields": [
-                {"name": "name", "label": "Full name"},
-                {"name": "email", "label": "Email", "inputType": "email"},
-                {"name": "phone", "label": "Phone", "inputType": "tel"},
-                {"name": "valuation", "label": "Estimated job cost ($)", "inputType": "number"},
-            ]}
-    if name == "review_application" and result.get("status") == "review":
-        return {"type": "review", "confirm": True, "data": {
-            "applicant": result.get("applicant"), "property": result.get("property"),
-            "job": result.get("job"), "work": result.get("work"),
-            "valuation": result.get("valuation"), "fee": result.get("fee"),
-            "feeDetails": result.get("feeDetails")}}
-    if name == "submit_application" and result.get("status") == "submitted":
-        return {"type": "result", "permitNumber": result.get("permitNumber")}
-    return None
+async def handle_set_fields(a):
+    """Deterministic engine: from the fields gathered so far, pick the next step + the widget
+    to show. The '_widget' key is popped in the loop before the model sees the result, so the
+    model never decides which widget appears, only what to say."""
+    if a.get("work_type") not in WORK_TYPES:
+        return {"need": "work_type",
+                "_widget": {"type": "chips", "field": "work_type", "options": list(WORK_TYPES)},
+                "message": "Ask which of the five jobs it is; they can tap it."}
+    if not str(a.get("property_address", "")).strip():
+        return {"need": "address",
+                "_widget": {"type": "address_autocomplete", "field": "property_address"},
+                "message": "Ask for the property address; they can search and pick it."}
+    matches = await api.validate_address(a["property_address"])
+    if not matches:
+        return {"need": "address",
+                "_widget": {"type": "address_autocomplete", "field": "property_address"},
+                "message": f"Could not find '{a['property_address']}'. Ask them to pick a valid address."}
+    a["lsoId"] = matches[0]["lsoId"]
+    if [f["name"] for f in _CONTACT_FIELDS if not str(a.get(f["name"]) or "").strip()]:
+        return {"need": "contact",
+                "_widget": {"type": "form", "field": "contact", "fields": _CONTACT_FIELDS},
+                "message": "Ask for their name, email, phone, and the estimated job cost."}
+    if not str(a.get("description") or "").strip():
+        a["description"] = a["work_type"]
+    errs = _validate(a)
+    if errs:
+        return {"need": "fix", "errors": errs, "message": "Ask them to correct: " + ", ".join(errs)}
+    a["subTypeId"] = WORK_TYPES[a["work_type"]]
+    fee = await api.fee_estimate(a)
+    return {"status": "review",
+            "_widget": {"type": "review", "confirm": True, "data": {
+                "applicant": {"name": a["name"], "email": a["email"], "phone": a["phone"]},
+                "property": str(matches[0]["address"]).strip(),
+                "job": a["work_type"], "work": a.get("description"),
+                "valuation": a["valuation"], "fee": fee.get("totalFee"),
+                "feeDetails": fee.get("feeDetails")}},
+            "message": "Show the review and the total fee, then ask them to reply CONFIRM to submit."}
 
 
 def _validate(a):
@@ -211,16 +211,12 @@ def _user_confirmed(history):
 
 
 async def _dispatch(name, args, history):
-    if name == "lookup_address":
-        return await handle_lookup(args)
-    if name == "review_application":
-        return await handle_review(args)
+    if name == "set_fields":
+        return await handle_set_fields(args)
     if name == "submit_application":
         return await handle_submit(args, _user_confirmed(history))
     if name == "leave_flow":
         return {"status": "left"}
-    if name == "show_widget":
-        return {"status": "widget_shown"}
     return {"error": f"unknown tool {name}"}
 
 
@@ -251,13 +247,13 @@ async def answer_apply_query(history, client, model):
             except Exception as e:
                 logging.exception("apply tool failed: %s", tc.function.name)
                 result = {"error": str(e)}
-            w = _widget_for(tc.function.name, args, result)
-            if w:
-                widget = w
+            if isinstance(result, dict) and "_widget" in result:
+                widget = result.pop("_widget")           # code-decided widget (set_fields)
             if tc.function.name == "leave_flow":
                 left = True
             if tc.function.name == "submit_application" and result.get("status") == "submitted":
                 submitted = True
+                widget = {"type": "result", "permitNumber": result.get("permitNumber")}
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
         if left:  # stop the loop immediately; the turn falls through to normal routing
             return {"reply": "", "in_flow": False, "left": True, "widget": None}

@@ -27,18 +27,20 @@ interface Props {
 }
 
 const chip: React.CSSProperties = {
-  padding: '8px 14px', borderRadius: 20, border: '1px solid #0f6cbd',
-  background: '#fff', color: '#0f6cbd', cursor: 'pointer', fontSize: 14, fontWeight: 600
+  padding: '10px 18px', borderRadius: 22, border: '1px solid #0f6cbd',
+  background: '#fff', color: '#0f6cbd', cursor: 'pointer', fontSize: 15, fontWeight: 600
 }
 const card: React.CSSProperties = {
-  marginTop: 8, padding: 14, border: '1px solid #e1e1e1', borderRadius: 10, background: '#fff', maxWidth: 420
+  marginTop: 10, padding: 18, border: '1px solid #e1e1e1', borderRadius: 12, background: '#fff',
+  width: '100%', maxWidth: 560, boxSizing: 'border-box'
 }
 const input: React.CSSProperties = {
-  width: '100%', padding: '10px 12px', border: '1px solid #c8c8c8', borderRadius: 8, fontSize: 14, boxSizing: 'border-box'
+  width: '100%', padding: '12px 14px', border: '1px solid #c8c8c8', borderRadius: 8,
+  fontSize: 15, boxSizing: 'border-box'
 }
 const primaryBtn: React.CSSProperties = {
-  marginTop: 12, padding: '10px 16px', borderRadius: 8, border: 'none',
-  background: '#0f6cbd', color: '#fff', cursor: 'pointer', fontSize: 14, fontWeight: 600
+  marginTop: 14, padding: '12px 20px', borderRadius: 8, border: 'none',
+  background: '#0f6cbd', color: '#fff', cursor: 'pointer', fontSize: 15, fontWeight: 600
 }
 
 const Row = ({ label, value, bold }: { label: string; value?: string | number; bold?: boolean }) =>
@@ -68,13 +70,13 @@ function AddressAutocomplete({ onSubmit, disabled }: { onSubmit: (t: string) => 
   }
 
   return (
-    <div style={{ marginTop: 8, maxWidth: 420, position: 'relative' }}>
+    <div style={{ marginTop: 10, maxWidth: 560, position: 'relative' }}>
       <input style={input} value={q} disabled={disabled} placeholder="Start typing the address…"
         onChange={e => onChange(e.target.value)} />
       {opts.length > 0 && (
         <div style={{ border: '1px solid #e1e1e1', borderRadius: 8, marginTop: 4, background: '#fff', overflow: 'hidden' }}>
           {opts.map(o => (
-            <div key={String(o.lsoId)} style={{ padding: '8px 12px', cursor: 'pointer', fontSize: 14 }}
+            <div key={String(o.lsoId)} style={{ padding: '11px 14px', cursor: 'pointer', fontSize: 15 }}
               onMouseDown={() => { setOpts([]); setQ(o.address); onSubmit(o.address) }}>
               {o.address}
             </div>
@@ -95,8 +97,8 @@ function FormWidget({ fields, onSubmit, disabled }: {
   return (
     <div style={card}>
       {fields.map(f => (
-        <div key={f.name} style={{ marginBottom: 8 }}>
-          <label style={{ display: 'block', fontSize: 13, color: '#666', marginBottom: 2 }}>{f.label}</label>
+        <div key={f.name} style={{ marginBottom: 14 }}>
+          <label style={{ display: 'block', fontSize: 14, color: '#555', marginBottom: 5 }}>{f.label}</label>
           <input style={input} type={f.inputType || 'text'} value={vals[f.name] || ''} disabled={disabled}
             onChange={e => setVals(p => ({ ...p, [f.name]: e.target.value }))} />
         </div>
@@ -115,7 +117,7 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
 
   if (widget.type === 'chips') {
     return (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 10 }}>
         {(widget.options || []).map(o => (
           <button key={o} style={chip} disabled={disabled} onClick={() => onSubmit(o)}>{o}</button>
         ))}

@@ -919,6 +919,7 @@ const Chat = () => {
                     ) : answer.role === 'assistant' ? (
                       <div className={styles.chatMessageGpt}>
                         <img src={ui?.chat_resp_logo} className={styles.chatIcon} aria-hidden="true" />
+                        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
                         {typeof answer.content === "string" && <Answer
                           answer={{
                             answer: answer.content,
@@ -938,6 +939,7 @@ const Chat = () => {
                             disabled={isLoading}
                           />
                         )}
+                        </div>
                       </div>
                     ) : answer.role === ERROR ? (
                       <div className={styles.chatMessageError}>
