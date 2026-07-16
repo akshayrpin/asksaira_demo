@@ -34,6 +34,7 @@ import {
   ExecResults,
 } from "../../api";
 import { Answer } from "../../components/Answer";
+import { ApplyWidget } from "../../components/ApplyWidget/ApplyWidget";
 import { QuestionInput } from "../../components/QuestionInput";
 import { ChatHistoryPanel } from "../../components/ChatHistory/ChatHistoryPanel";
 import { AppStateContext } from "../../state/AppProvider";
@@ -748,6 +749,25 @@ const Chat = () => {
     return null;
   }
 
+  const parseWidgetFromMessage = (message: ChatMessage) => {
+    if (message?.role === "tool" && typeof message?.content === "string") {
+      try {
+        return JSON.parse(message.content)?.widget ?? null
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+
+  // Post a widget tap/selection back as a normal user message (same path as typing).
+  const sendWidgetInput = (text: string) => {
+    const convId = appStateContext?.state.currentChat?.id
+    appStateContext?.state.isCosmosDBAvailable?.cosmosDB
+      ? makeApiRequestWithCosmosDB(text, convId)
+      : makeApiRequestWithoutCosmosDB(text, convId)
+  }
+
   const disabledButton = () => {
     return (
       isLoading ||
@@ -911,6 +931,13 @@ const Chat = () => {
                           onCitationClicked={c => onShowCitation(c)}
                           onExectResultClicked={() => onShowExecResult(answerId)}
                         />}
+                        {index === messages.length - 1 && parseWidgetFromMessage(messages[index - 1]) && (
+                          <ApplyWidget
+                            widget={parseWidgetFromMessage(messages[index - 1])}
+                            onSubmit={sendWidgetInput}
+                            disabled={isLoading}
+                          />
+                        )}
                       </div>
                     ) : answer.role === ERROR ? (
                       <div className={styles.chatMessageError}>

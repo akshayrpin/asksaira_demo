@@ -46,11 +46,13 @@ Collect, asking for what's missing one or two items at a time (do not dump the w
 
 Rules:
 - Use ONLY what the user tells you. Never invent a value.
-- Figure out the work type from what the user says (e.g. "my water heater broke" -> Water Heater Replacement). If it's unclear, ask which of the five.
-- As soon as the user gives the property address, call lookup_address to verify it. If not found, ask for a corrected address.
+- Figure out the work type from what the user says (e.g. "my water heater broke" -> Water Heater Replacement). If it's unclear, call show_widget("work_type") and add a one-line prompt so they can pick it.
+- When you need the property address, call show_widget("address") and add a one-line prompt so they can search and select it. Once they give an address, call lookup_address to verify it; if not found, ask for a corrected address.
+- To collect the applicant's name, email, phone and the estimated job cost together, call show_widget("contact") and add a one-line prompt. (Default the work description to the job name unless the user gives one.)
 - When every field is collected, call review_application (this shows the applicant a summary and the fee; it does NOT submit).
 - After the review is shown, the user must reply with the word CONFIRM to submit. When they do, call submit_application. Do not claim it is submitted yourself.
-- If at any point the user clearly stops applying and asks something unrelated, call leave_flow so the assistant can hand them back to normal help. Do not force them to keep applying.
+- Instant online filing is available ONLY for those five jobs. If the user wants a permit that is NOT one of them (or says theirs isn't listed), do NOT call leave_flow. Reply briefly that instant online filing currently covers only those five job types (HVAC, House Rewire, Panel Upgrade, Water Heater Replacement, House Repipe), and for any other permit they can use the city's permit page or contact the permit office.
+- Only call leave_flow when the user clearly switches to an UNRELATED topic (a different city question, general chit-chat), never as a way to handle an unsupported permit type. Do not force them to keep applying.
 - Be concise and friendly."""
 
 TOOLS = [
@@ -90,7 +92,40 @@ TOOLS = [
         "description": "The user has stopped applying and asked something unrelated. Hand control back to normal help.",
         "parameters": {"type": "object", "properties": {}},
     }},
+    {"type": "function", "function": {
+        "name": "show_widget",
+        "description": "Surface a UI element for the next input instead of asking in plain text. 'work_type' = tappable job chips; 'address' = address search/select; 'contact' = a form for name, email, phone, and estimated job cost. Always add a short one-line prompt in your reply alongside it.",
+        "parameters": {"type": "object", "properties": {
+            "widget": {"type": "string", "enum": ["work_type", "address", "contact"]}},
+            "required": ["widget"]},
+    }},
 ]
+
+
+def _widget_for(name, args, result):
+    """Map a tool call to a UI widget payload the frontend renders. Returns None for tools
+    that don't drive UI. The fixed five: chips, address_autocomplete, form, review, result."""
+    if name == "show_widget":
+        if args.get("widget") == "work_type":
+            return {"type": "chips", "field": "work_type", "options": list(WORK_TYPES)}
+        if args.get("widget") == "address":
+            return {"type": "address_autocomplete", "field": "property_address"}
+        if args.get("widget") == "contact":
+            return {"type": "form", "field": "contact", "fields": [
+                {"name": "name", "label": "Full name"},
+                {"name": "email", "label": "Email", "inputType": "email"},
+                {"name": "phone", "label": "Phone", "inputType": "tel"},
+                {"name": "valuation", "label": "Estimated job cost ($)", "inputType": "number"},
+            ]}
+    if name == "review_application" and result.get("status") == "review":
+        return {"type": "review", "confirm": True, "data": {
+            "applicant": result.get("applicant"), "property": result.get("property"),
+            "job": result.get("job"), "work": result.get("work"),
+            "valuation": result.get("valuation"), "fee": result.get("fee"),
+            "feeDetails": result.get("feeDetails")}}
+    if name == "submit_application" and result.get("status") == "submitted":
+        return {"type": "result", "permitNumber": result.get("permitNumber")}
+    return None
 
 
 def _validate(a):
@@ -184,6 +219,8 @@ async def _dispatch(name, args, history):
         return await handle_submit(args, _user_confirmed(history))
     if name == "leave_flow":
         return {"status": "left"}
+    if name == "show_widget":
+        return {"status": "widget_shown"}
     return {"error": f"unknown tool {name}"}
 
 
@@ -198,13 +235,15 @@ async def answer_apply_query(history, client, model):
     messages = [{"role": "system", "content": SYSTEM}] + list(history)
     left = False
     submitted = False
+    widget = None
     for _ in range(MAX_STEPS):
         resp = await client.chat.completions.create(
             model=model, messages=messages, tools=TOOLS, temperature=0)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         if not msg.tool_calls:
-            return {"reply": msg.content or "", "in_flow": not (left or submitted), "left": left}
+            return {"reply": msg.content or "", "in_flow": not (left or submitted),
+                    "left": left, "widget": widget}
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
@@ -212,11 +251,15 @@ async def answer_apply_query(history, client, model):
             except Exception as e:
                 logging.exception("apply tool failed: %s", tc.function.name)
                 result = {"error": str(e)}
+            w = _widget_for(tc.function.name, args, result)
+            if w:
+                widget = w
             if tc.function.name == "leave_flow":
                 left = True
             if tc.function.name == "submit_application" and result.get("status") == "submitted":
                 submitted = True
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
         if left:  # stop the loop immediately; the turn falls through to normal routing
-            return {"reply": "", "in_flow": False, "left": True}
-    return {"reply": "Sorry, let's try that again.", "in_flow": not (left or submitted), "left": left}
+            return {"reply": "", "in_flow": False, "left": True, "widget": None}
+    return {"reply": "Sorry, let's try that again.", "in_flow": not (left or submitted),
+            "left": left, "widget": widget}

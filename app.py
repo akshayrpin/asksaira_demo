@@ -619,37 +619,41 @@ async def try_apply_answer(request_body):
             history, client, app_settings.azure_openai.model)
         if result.get("left"):        # user changed topic -> fall through, drop the tag
             return None
-        return {"reply": result["reply"], "in_flow": result["in_flow"]}
+        return {"reply": result["reply"], "in_flow": result["in_flow"], "widget": result.get("widget")}
     except Exception:
         logging.exception("apply agent failed; falling back to RAG")
         return None
 
 
-def _apply_messages(reply, in_flow):
+def _apply_messages(reply, in_flow, widget=None):
     """Build choices[0].messages: a tag (tool) message first when in_flow, then the reply.
-    The tool message is how the flow tag round-trips (see _apply_flow_active)."""
+    The tool message is how the flow tag round-trips (see _apply_flow_active), and it also
+    carries the interactive `widget` payload for the frontend to render."""
     msgs = []
     if in_flow:
-        msgs.append({"role": "tool", "content": json.dumps({"flow": APPLY_FLOW})})
+        tag = {"flow": APPLY_FLOW}
+        if widget:
+            tag["widget"] = widget
+        msgs.append({"role": "tool", "content": json.dumps(tag)})
     msgs.append({"role": "assistant", "content": reply})
     return msgs
 
 
-def apply_non_streaming_response(reply, in_flow, history_metadata):
+def apply_non_streaming_response(reply, in_flow, history_metadata, widget=None):
     obj = _permit_message_obj()
     obj["id"] = "apply-agent"
-    obj["choices"][0]["messages"] = _apply_messages(reply, in_flow)
+    obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget)
     obj["history_metadata"] = history_metadata
     obj["apim-request-id"] = "apply-agent"
     return obj
 
 
-def apply_stream_response(reply, in_flow, history_metadata):
+def apply_stream_response(reply, in_flow, history_metadata, widget=None):
     async def generate():
         obj = _permit_message_obj()
         obj["id"] = "apply-agent"
         obj["object"] = "extensions.chat.completion.chunk"
-        obj["choices"][0]["messages"] = _apply_messages(reply, in_flow)
+        obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget)
         obj["history_metadata"] = history_metadata
         obj["apim-request-id"] = "apply-agent"
         yield obj
@@ -711,7 +715,8 @@ async def complete_chat_request(request_body, request_headers):
         history_metadata = request_body.get("history_metadata", {})
         apply_answer = await try_apply_answer(request_body)
         if apply_answer is not None:
-            return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"], history_metadata)
+            return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"],
+                                                history_metadata, apply_answer.get("widget"))
         permit_answer = await try_permit_answer(request_body)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
@@ -723,7 +728,8 @@ async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
     apply_answer = await try_apply_answer(request_body)
     if apply_answer is not None:
-        return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"], history_metadata)
+        return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"],
+                                     history_metadata, apply_answer.get("widget"))
     permit_answer = await try_permit_answer(request_body)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
@@ -787,6 +793,22 @@ def get_frontend_settings():
     except Exception as e:
         logging.exception("Exception in /frontend_settings")
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/apply/address-search", methods=["GET"])
+async def apply_address_search():
+    """Type-ahead search for the instant-permit address widget. Backed by the once-cached
+    getAllAddresses list (prefix-first), so it never hits the permit API per keystroke.
+    Returns [{address, lsoId, apn}] (empty for queries under 2 chars)."""
+    if not PERMIT_APPLY_ENABLED or apply_agent is None:
+        return jsonify([]), 200
+    try:
+        from backend.permit_agent import apply_client
+        results = await apply_client.search_addresses(request.args.get("q", ""), limit=8)
+        return jsonify(results), 200
+    except Exception:
+        logging.exception("apply address search failed")
+        return jsonify([]), 200
 
 
 ## Conversation History API ##
