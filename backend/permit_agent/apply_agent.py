@@ -86,6 +86,13 @@ _CONTACT_FIELDS = [
 ]
 
 
+def _contact_widget(a):
+    """Contact form prefilled with whatever's already entered, so a re-show (e.g. after a bad
+    phone) doesn't force the user to retype the fields that were fine."""
+    values = {f["name"]: a.get(f["name"]) for f in _CONTACT_FIELDS if a.get(f["name"]) not in (None, "")}
+    return {"type": "form", "field": "contact", "fields": _CONTACT_FIELDS, "values": values}
+
+
 async def handle_set_fields(a):
     """Deterministic engine: from the fields gathered so far, pick the next step + the widget
     to show. The '_widget' key is popped in the loop before the model sees the result, so the
@@ -106,14 +113,14 @@ async def handle_set_fields(a):
     a["lsoId"] = matches[0]["lsoId"]
     if [f["name"] for f in _CONTACT_FIELDS if not str(a.get(f["name"]) or "").strip()]:
         return {"need": "contact",
-                "_widget": {"type": "form", "field": "contact", "fields": _CONTACT_FIELDS},
+                "_widget": _contact_widget(a),
                 "message": "Ask for their name, email, phone, and the estimated job cost."}
     if not str(a.get("description") or "").strip():
         a["description"] = a["work_type"]
     errs = _validate(a)
     if errs:
         return {"need": "contact",
-                "_widget": {"type": "form", "field": "contact", "fields": _CONTACT_FIELDS},
+                "_widget": _contact_widget(a),
                 "message": "Some details need fixing (" + ", ".join(errs) + "). Ask them to re-enter them."}
     a["subTypeId"] = WORK_TYPES[a["work_type"]]
     fee = await api.fee_estimate(a)

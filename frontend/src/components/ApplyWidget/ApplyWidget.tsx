@@ -7,6 +7,7 @@ export interface ApplyWidgetData {
   field?: string
   options?: string[]
   fields?: { name: string; label: string; inputType?: string }[]
+  values?: Record<string, string | number>
   confirm?: boolean
   data?: {
     applicant?: { name?: string; email?: string; phone?: string }
@@ -87,10 +88,15 @@ function AddressAutocomplete({ onSubmit, disabled }: { onSubmit: (t: string) => 
   )
 }
 
-function FormWidget({ fields, onSubmit, disabled }: {
-  fields: { name: string; label: string; inputType?: string }[]; onSubmit: (t: string) => void; disabled?: boolean
+function FormWidget({ fields, values, onSubmit, disabled }: {
+  fields: { name: string; label: string; inputType?: string }[]
+  values?: Record<string, string | number>; onSubmit: (t: string) => void; disabled?: boolean
 }) {
-  const [vals, setVals] = useState<Record<string, string>>({})
+  const [vals, setVals] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {}       // prefill from values so a re-show keeps entries
+    for (const f of fields) { const v = values?.[f.name]; if (v != null) init[f.name] = String(v) }
+    return init
+  })
   const ready = fields.every(f => (vals[f.name] || '').trim())
   // Post the collected fields as one message; the agent extracts each value (name/email/phone/valuation).
   const submit = () => onSubmit(fields.map(f => `${f.name}: ${vals[f.name] || ''}`).join(', '))
@@ -112,7 +118,7 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
   if (!widget) return null
 
   if (widget.type === 'form') {
-    return <FormWidget fields={widget.fields || []} onSubmit={onSubmit} disabled={disabled} />
+    return <FormWidget fields={widget.fields || []} values={widget.values} onSubmit={onSubmit} disabled={disabled} />
   }
 
   if (widget.type === 'chips') {

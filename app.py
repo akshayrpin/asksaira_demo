@@ -630,9 +630,11 @@ def _apply_messages(reply, in_flow, widget=None):
     The tool message is how the flow tag round-trips (see _apply_flow_active), and it also
     carries the interactive `widget` payload for the frontend to render."""
     msgs = []
-    if in_flow:
-        tag = {"flow": APPLY_FLOW}
-        if widget:
+    if in_flow or widget:
+        tag = {}
+        if in_flow:               # 'flow' marks mid-flow so the classifier is skipped next turn
+            tag["flow"] = APPLY_FLOW
+        if widget:                # emit the widget even on the final (submitted) turn -> result card
             tag["widget"] = widget
         msgs.append({"role": "tool", "content": json.dumps(tag)})
     msgs.append({"role": "assistant", "content": reply})
