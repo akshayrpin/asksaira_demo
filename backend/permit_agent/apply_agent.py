@@ -57,7 +57,6 @@ TOOLS = [
             "property_address": {"type": "string"},
             "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
             "valuation": {"type": "number", "description": "estimated job cost in dollars"},
-            "description": {"type": "string"},
         }},
     }},
     {"type": "function", "function": {
@@ -69,9 +68,7 @@ TOOLS = [
             "work_type": {"type": "string", "enum": ["HVAC", "House Rewire", "Panel Upgrade",
                           "Water Heater Replacement", "House Repipe"]},
             "valuation": {"type": "number"},
-            "description": {"type": "string"},
-        }, "required": ["name", "email", "phone", "property_address", "work_type",
-                        "valuation", "description"]},
+        }, "required": ["name", "email", "phone", "property_address", "work_type", "valuation"]},
     }},
     {"type": "function", "function": {
         "name": "leave_flow",
@@ -130,7 +127,7 @@ async def handle_set_fields(a):
 
 def _validate(a):
     errs = []
-    for f in ["name", "email", "phone", "property_address", "description"]:
+    for f in ["name", "email", "phone", "property_address"]:
         if not str(a.get(f, "")).strip():
             errs.append(f"missing {f}")
     if a.get("email") and not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", a["email"]):
@@ -144,6 +141,8 @@ def _validate(a):
 
 async def _resolve(a):
     """Validate fields + resolve address + attach codes/lsoId. Returns (prop, error_dict)."""
+    if not str(a.get("description") or "").strip():
+        a["description"] = a.get("work_type", "")   # description is never asked; default it
     errs = _validate(a)
     if errs:
         return None, {"status": "invalid", "errors": errs}
