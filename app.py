@@ -811,6 +811,23 @@ async def apply_address_search():
         return jsonify([]), 200
 
 
+@bp.route("/apply/permit-pdf", methods=["GET"])
+async def apply_permit_pdf():
+    """Download the permit PDF (proxies the permit API's getPermitReport) for the result widget."""
+    if not PERMIT_APPLY_ENABLED or apply_agent is None:
+        return "", 404
+    from quart import Response
+    from backend.permit_agent import apply_client
+    permit = request.args.get("permit", "")
+    try:
+        pdf = await apply_client.permit_report(permit)
+    except Exception:
+        logging.exception("permit pdf fetch failed")
+        return jsonify({"error": "report unavailable"}), 502
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="permit-{permit}.pdf"'})
+
+
 ## Conversation History API ##
 @bp.route("/history/generate", methods=["POST"])
 async def add_conversation():

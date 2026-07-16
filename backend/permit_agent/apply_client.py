@@ -189,3 +189,14 @@ async def add_permit(app):
     }
     async with aiohttp.ClientSession() as s:
         return await _request(s, "POST", "addPermit", json_body=body)
+
+
+async def permit_report(act_nbr):
+    """Fetch the permit PDF (bytes) from getPermitReport, for the download button."""
+    async with aiohttp.ClientSession() as s:
+        token = await _get_token(s)
+        async with s.get(f"{BASE}/getPermitReport", params={"actNbr": act_nbr},
+                         headers={"Authorization": token},
+                         timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as r:
+            r.raise_for_status()
+            return await r.read()

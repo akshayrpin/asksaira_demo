@@ -112,7 +112,9 @@ async def handle_set_fields(a):
         a["description"] = a["work_type"]
     errs = _validate(a)
     if errs:
-        return {"need": "fix", "errors": errs, "message": "Ask them to correct: " + ", ".join(errs)}
+        return {"need": "contact",
+                "_widget": {"type": "form", "field": "contact", "fields": _CONTACT_FIELDS},
+                "message": "Some details need fixing (" + ", ".join(errs) + "). Ask them to re-enter them."}
     a["subTypeId"] = WORK_TYPES[a["work_type"]]
     fee = await api.fee_estimate(a)
     return {"status": "review",
@@ -131,7 +133,9 @@ def _validate(a):
         if not str(a.get(f, "")).strip():
             errs.append(f"missing {f}")
     if a.get("email") and not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", a["email"]):
-        errs.append("invalid email")
+        errs.append("email is not a valid address")
+    if a.get("phone") and len(re.sub(r"\D", "", str(a["phone"]))) != 10:
+        errs.append("phone must be 10 digits")
     if not isinstance(a.get("valuation"), (int, float)) or a.get("valuation", 0) <= 0:
         errs.append("valuation must be greater than 0")
     if a.get("work_type") not in WORK_TYPES:

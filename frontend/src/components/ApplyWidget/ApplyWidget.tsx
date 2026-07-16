@@ -149,6 +149,10 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
       <div style={card}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Permit filed ✅</div>
         <div>Permit number: <b>{widget.permitNumber}</b></div>
+        <a href={`/apply/permit-pdf?permit=${encodeURIComponent(widget.permitNumber || '')}`} download
+          style={{ ...primaryBtn, display: 'inline-block', textDecoration: 'none', marginTop: 12 }}>
+          Download permit PDF
+        </a>
       </div>
     )
   }
