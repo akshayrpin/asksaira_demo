@@ -662,6 +662,49 @@ def apply_stream_response(reply, in_flow, history_metadata, widget=None):
     return generate()
 
 
+# Offer-the-apply-chip: when a normal RAG answer is about one of the five instant-permit
+# jobs, we staple a "start the application" chip under it. This is NOT a routing decision.
+# The question still goes down the normal RAG path; the chip only posts an apply message
+# (entering the existing flow) if the user taps it. Deterministic keyword match, no LLM call.
+# Job strings must equal apply_agent.WORK_TYPES keys so set_fields resolves the work type.
+# Water heater is listed first so "heat pump water heater" resolves to the heater, not HVAC.
+_JOB_KEYWORDS = [
+    ("Water Heater Replacement", ("water heater", "hot water heater", "water-heater")),
+    ("HVAC", ("hvac", "furnace", "air conditioning", "air conditioner", "ac unit", "heat pump", "central air")),
+    ("Panel Upgrade", ("panel upgrade", "electrical panel", "service panel", "breaker panel", "sub panel", "subpanel", "main panel")),
+    ("House Rewire", ("rewire", "re-wire", "house wiring", "rewiring")),
+    ("House Repipe", ("repipe", "re-pipe", "replumb", "re-plumb", "house piping")),
+]
+
+
+def detect_instant_permit_job(query):
+    """Return the WORK_TYPES display name if the query is about one of the five jobs, else None."""
+    if not query or not isinstance(query, str):
+        return None
+    q = query.lower()
+    for job, kws in _JOB_KEYWORDS:
+        if any(k in q for k in kws):
+            return job
+    return None
+
+
+def _merge_apply_chip(formatted, job):
+    """Merge an 'Apply for a <job> permit' chip into the citations tool message of a RAG
+    response so the frontend renders it under the answer (same tool-tag channel the apply
+    flow uses). No-op when this object/chunk carries no tool message (e.g. abstentions)."""
+    widget = {"type": "chips", "options": [f"Apply for a {job} permit"]}
+    for m in formatted.get("choices", [{}])[0].get("messages", []):
+        if m.get("role") == "tool" and isinstance(m.get("content"), str):
+            try:
+                data = json.loads(m["content"])
+            except (ValueError, TypeError):
+                data = {}
+            if isinstance(data, dict):
+                data["widget"] = widget
+                m["content"] = json.dumps(data)
+    return formatted
+
+
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -722,8 +765,14 @@ async def complete_chat_request(request_body, request_headers):
         permit_answer = await try_permit_answer(request_body)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
+        # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
+        job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
+            if PERMIT_APPLY_ENABLED else None
         response, apim_request_id = await send_chat_request(request_body, request_headers)
-        return format_non_streaming_response(response, history_metadata, apim_request_id)
+        rag = format_non_streaming_response(response, history_metadata, apim_request_id)
+        if job:
+            _merge_apply_chip(rag, job)
+        return rag
 
 
 async def stream_chat_request(request_body, request_headers):
@@ -735,8 +784,11 @@ async def stream_chat_request(request_body, request_headers):
     permit_answer = await try_permit_answer(request_body)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
+    # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
+    job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
+        if PERMIT_APPLY_ENABLED else None
     response, apim_request_id = await send_chat_request(request_body, request_headers)
-    
+
     async def generate():
         context_logged = False
         full_response = []
@@ -752,7 +804,10 @@ async def stream_chat_request(request_body, request_headers):
                         context_logged = True
                 if getattr(delta, "content", None):
                     full_response.append(delta.content)
-            yield format_stream_response(completionChunk, history_metadata, apim_request_id)
+            formatted = format_stream_response(completionChunk, history_metadata, apim_request_id)
+            if job:                       # merge the chip into the citations tool chunk
+                _merge_apply_chip(formatted, job)
+            yield formatted
         if full_response:
             logging.info(f"[OPENAI RESPONSE] {''.join(full_response)}")
 
