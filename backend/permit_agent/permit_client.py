@@ -40,6 +40,16 @@ TIMEOUT = 25
 ALLOWED_STATUSES = ["Permit Final", "Permit Issued", "Permit Reissued", "Approved", "Issued"]
 _STATUS_FILTER = "status:(" + " OR ".join(f'"{s}"' for s in ALLOWED_STATUSES) + ")"
 
+# Code Enforcement: Code Compliance (Andrea Ceniceros, 2026-07-20) approved ONLY these fields
+# for display, plus a line directing users to the Code Enforcement DEPARTMENT (not an individual).
+# Never surface description / people / valuation for these records.
+CODE_ENFORCEMENT_MODULE = "CODE ENFORCEMENT"
+CODE_ENFORCEMENT_FIELDS = ["act_nbr", "status", "type", "address", "applied_date"]  # Started = applied_date (confirm)
+# Public DEPARTMENT number per ticket CB-0021 (Andrea's email signed her direct line 238-5279;
+# the general public line is 238-5225). TODO: add the Code Enforcement DEPARTMENT email once
+# confirmed. Do NOT use a personal address such as aceniceros@.
+CODE_ENFORCEMENT_CONTACT = "For more information, contact Burbank Code Enforcement at (818) 238-5225."
+
 # Fields a user actually cares about, kept small so tool results stay cheap.
 _SUMMARY = ["act_nbr", "type", "status", "department", "address",
             "applied_date", "valuation_calculated", "description"]
@@ -142,11 +152,14 @@ def _fqs(type=None, status=None, department=None, module=None, address=None,
     return out
 
 
-async def _query(params, facet=None, status_filter=True):
-    # The status whitelist is a PERMIT concept (only surface granted permits). Business-tax /
-    # license records use a different status vocabulary (Active, Paid/Current, Out of Business,
-    # ...), so callers targeting a business module pass status_filter=False, else those records
-    # would all be filtered out. See BUSINESS_MODULES.
+async def _query(params, facet=None, status_filter=False):
+    # The granted-permit status whitelist (ALLOWED_STATUSES) is RETIRED as the default. Applied
+    # to every query it (a) filtered out business-tax/license records (Active, Paid, Out of
+    # Business), which is why business counts came back empty, (b) hid code enforcement
+    # (Open/Closed), which the city has now approved for display, and (c) undercounted permits in
+    # valid in-progress statuses (e.g. "PC w/ Corrections", "Permit On Hold"). Pass
+    # status_filter=True to re-apply it for a specific "granted-only" query once the city defines
+    # which statuses should count.
     qp = list(params) + [("wt", "json")]
     if status_filter:
         qp.append(("fq", _STATUS_FILTER))
@@ -161,6 +174,18 @@ async def _query(params, facet=None, status_filter=True):
 
 def _pick(doc, fields):
     return {k: doc[k] for k in fields if k in doc and doc[k] not in (None, "", " ")}
+
+
+def _summary_for(doc):
+    """Per-record summary. Code Enforcement records are restricted to the city-approved fields
+    (Permit Number, Status, Type, Address, Started); every other module uses the full summary."""
+    if str(doc.get("module", "")).upper() == CODE_ENFORCEMENT_MODULE:
+        return _pick(doc, CODE_ENFORCEMENT_FIELDS)
+    return _pick(doc, _SUMMARY)
+
+
+def _has_code_enforcement(docs):
+    return any(str(d.get("module", "")).upper() == CODE_ENFORCEMENT_MODULE for d in docs)
 
 
 # --------------------------- type resolution ---------------------------
@@ -260,11 +285,14 @@ async def search(query=None, limit=12, **filters):
     qp = [("q", q), ("rows", str(limit)), ("sort", "applied_date desc")] + _fqs(**filters)
     data = await _query(qp)
     resp = data["response"]
-    return {
+    out = {
         "total": resp["numFound"],
         "shown": len(resp["docs"]),
-        "results": [_pick(d, _SUMMARY) for d in resp["docs"]],
+        "results": [_summary_for(d) for d in resp["docs"]],
     }
+    if _has_code_enforcement(resp["docs"]):
+        out["note"] = CODE_ENFORCEMENT_CONTACT
+    return out
 
 
 async def get_permit(act_nbr):
@@ -277,7 +305,11 @@ async def get_permit(act_nbr):
     chosen = exact or docs
     if not chosen:
         return {"found": False}
-    return {"found": True, "exact": bool(exact), "permit": _pick(chosen[0], _DETAIL)}
+    doc = chosen[0]
+    if str(doc.get("module", "")).upper() == CODE_ENFORCEMENT_MODULE:
+        return {"found": True, "exact": bool(exact),
+                "permit": _pick(doc, CODE_ENFORCEMENT_FIELDS), "note": CODE_ENFORCEMENT_CONTACT}
+    return {"found": True, "exact": bool(exact), "permit": _pick(doc, _DETAIL)}
 
 
 async def distinct_values(field, limit=50):

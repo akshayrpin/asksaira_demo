@@ -3,7 +3,7 @@ import { useRef, useState } from 'react'
 // The fixed-five widget payloads emitted by the instant-permit apply agent
 // (backend: apply_agent._widget_for). Rendered inline under the assistant's message.
 export interface ApplyWidgetData {
-  type: 'chips' | 'address_autocomplete' | 'form' | 'review' | 'result'
+  type: 'chips' | 'address_autocomplete' | 'form' | 'review' | 'result' | 'pay'
   field?: string
   options?: string[]
   fields?: { name: string; label: string; inputType?: string }[]
@@ -19,6 +19,16 @@ export interface ApplyWidgetData {
     feeDetails?: { feeDescription?: string; feeAmount?: number }[]
   }
   permitNumber?: string
+  amount?: number   // pay widget: fee due
+  email?: string    // pay widget: where the (mock) receipt is "sent"
+  // Generic review/result fields, shared by the PRR + inspection mock flows:
+  title?: string                            // card heading
+  rows?: { label: string; value?: string | number }[]  // review: generic rows instead of `data`
+  confirmLabel?: string                     // review: button label (still posts 'CONFIRM')
+  reference?: string                        // result: reference/confirmation number
+  refLabel?: string                         // result: label for that number
+  message?: string                          // result: a line of body text
+  download?: boolean                        // result: false hides the permit-PDF link
 }
 
 interface Props {
@@ -139,26 +149,51 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
     const d = widget.data || {}
     return (
       <div style={card}>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Review your application</div>
-        <Row label="Job" value={d.job} />
-        <Row label="Address" value={d.property} />
-        <Row label="Work" value={d.work} />
-        <Row label="Valuation" value={d.valuation != null ? `$${d.valuation}` : undefined} />
-        <Row label="Fee" value={d.fee != null ? `$${d.fee}` : undefined} bold />
-        <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('CONFIRM')}>Confirm & submit</button>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>{widget.title || 'Review your application'}</div>
+        {widget.rows
+          ? widget.rows.map(r => <Row key={r.label} label={r.label} value={r.value} />)
+          : (<>
+              <Row label="Job" value={d.job} />
+              <Row label="Address" value={d.property} />
+              <Row label="Work" value={d.work} />
+              <Row label="Valuation" value={d.valuation != null ? `$${d.valuation}` : undefined} />
+              <Row label="Fee" value={d.fee != null ? `$${d.fee}` : undefined} bold />
+            </>)}
+        <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('CONFIRM')}>
+          {widget.confirmLabel || 'Confirm'}
+        </button>
+      </div>
+    )
+  }
+
+  if (widget.type === 'pay') {
+    const amt = widget.amount
+    return (
+      <div style={card}>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Permit filed ✅</div>
+        <div style={{ marginBottom: 10 }}>Permit number: <b>{widget.permitNumber}</b></div>
+        <Row label="Amount due" value={amt != null ? `$${amt}` : 'Fee'} bold />
+        <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('PAID')}>
+          {amt != null ? `Pay $${amt}` : 'Pay now'}
+        </button>
       </div>
     )
   }
 
   if (widget.type === 'result') {
+    const ref = widget.reference || widget.permitNumber
+    const showPdf = widget.download !== false && widget.permitNumber
     return (
       <div style={card}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>Permit filed ✅</div>
-        <div>Permit number: <b>{widget.permitNumber}</b></div>
-        <a href={`/apply/permit-pdf?permit=${encodeURIComponent(widget.permitNumber || '')}`} download
-          style={{ ...primaryBtn, display: 'inline-block', textDecoration: 'none', marginTop: 12 }}>
-          Download permit PDF
-        </a>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>{widget.title || 'Permit filed ✅'}</div>
+        <div>{widget.refLabel || 'Permit number'}: <b>{ref}</b></div>
+        {widget.message && <div style={{ marginTop: 8, color: '#444' }}>{widget.message}</div>}
+        {showPdf && (
+          <a href={`/apply/permit-pdf?permit=${encodeURIComponent(widget.permitNumber || '')}`} download
+            style={{ ...primaryBtn, display: 'inline-block', textDecoration: 'none', marginTop: 12 }}>
+            Download permit PDF
+          </a>
+        )}
       </div>
     )
   }

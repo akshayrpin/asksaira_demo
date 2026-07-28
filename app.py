@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import logging
+import re
 import uuid
 import httpx
 import asyncio
@@ -48,6 +49,16 @@ try:
 except Exception:  # missing deps -> apply flow simply stays off
     apply_agent = None
     logging.exception("apply agent unavailable; instant-permit flow disabled")
+try:  # mock conversational flows (public-record request + inspection scheduling)
+    from backend.permit_agent import prr_agent, inspection_agent
+except Exception:
+    prr_agent = inspection_agent = None
+    logging.exception("mock flow agents unavailable; PRR + inspection disabled")
+try:
+    from backend import meetings as meetings_feed
+except Exception:  # missing deps -> live meeting lookup stays off
+    meetings_feed = None
+    logging.exception("meetings feed unavailable; meeting questions fall back to RAG")
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -532,6 +543,29 @@ async def try_permit_answer(request_body):
         return None
 
 
+# Live meeting-schedule lookup (Burbank-specific: only active when its Granicus feed URL is set).
+MEETINGS_ENABLED = bool(meetings_feed) and bool(os.environ.get("MEETINGS_FEED_URL"))
+
+
+async def try_meetings_answer(request_body):
+    """Answer 'when is the next <body> meeting' from the live Granicus feed. Returns the answer
+    string, or None to fall through to RAG. Off unless MEETINGS_FEED_URL is set."""
+    if not MEETINGS_ENABLED:
+        return None
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    user_query = _latest_user_query(messages)
+    if not user_query or not meetings_feed.is_meeting_query(user_query):
+        return None
+    try:
+        answer = await meetings_feed.answer_meeting_query(user_query, datetime.date.today())
+        if answer:
+            logging.info("[MEETINGS FEED] handled: %s", user_query)
+        return answer
+    except Exception:
+        logging.exception("meetings feed failed; falling back to RAG")
+        return None
+
+
 def _permit_message_obj():
     return {
         "id": "permit-agent",
@@ -568,28 +602,83 @@ def permit_stream_response(answer, history_metadata):
 # collected fields each turn). A hidden tag in the assistant turn's `context` marks that
 # we're mid-flow, so cheap code can skip the classifier while an application is in progress.
 PERMIT_APPLY_ENABLED = bool(apply_agent) and os.environ.get("PERMIT_APPLY_ENABLED", "0") != "0"
-APPLY_FLOW = "instant-permit"  # the tag value; rides in a `context` -> `tool` message
+APPLY_FLOW = "instant-permit"        # mid-flow tag; rides in a `context` -> `tool` message
+APPLY_OFFER = "instant-permit-offer"  # pre-flow "want help applying?" yes/no offer tag
+APPLY_PAY = "instant-permit-pay"      # post-submit: the pay card is showing, awaiting payment
+
+# Mock conversational flows (public-record request + inspection). Both are fully mock: no RAG,
+# no external API. Keyword-triggered, then they reuse the same tag/widget round-trip as apply.
+MOCK_FLOWS_ENABLED = bool(prr_agent) and bool(inspection_agent) and os.environ.get("MOCK_FLOWS_ENABLED", "0") != "0"
+PRR_OFFER = "public-record-offer"     # "want help submitting a request?" yes/no offer
+PRR_FLOW = "public-record"            # mid-flow: collecting + reviewing the request
+INSPECTION_FLOW = "inspection"        # mid-flow: scheduling/rescheduling
 
 
-def _apply_flow_active(messages):
-    """True if the MOST RECENT bot turn carried the apply tag. The frontend replays the
+def _flow_family(tag):
+    """Which flow owns this tag, so each try_* handler yields to the right one."""
+    if tag in (APPLY_FLOW, APPLY_OFFER, APPLY_PAY):
+        return "apply"
+    if tag in (PRR_FLOW, PRR_OFFER):
+        return "prr"
+    if tag == INSPECTION_FLOW:
+        return "inspection"
+    return None
+
+
+def _last_bot_flow(messages):
+    """The `flow` value tagged on the MOST RECENT bot turn, or None. The frontend replays the
     tag as a `tool` message sitting just before the assistant message, so we find the last
-    assistant message and check the tool message right before it. Older tags don't count,
-    only the last turn, so once the flow ends (no tag emitted) we correctly fall out."""
+    assistant message and read the tool message right before it. Only the last turn counts,
+    so once the flow ends (no tag emitted) we correctly fall out."""
     idx = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
             idx = i
             break
     if idx is None:
-        return False
+        return None
     prev = messages[idx - 1] if idx > 0 else None
     if not prev or prev.get("role") != "tool":
-        return False
+        return None
     try:
-        return json.loads(prev.get("content") or "{}").get("flow") == APPLY_FLOW
+        return json.loads(prev.get("content") or "{}").get("flow")
     except (ValueError, TypeError):
-        return False
+        return None
+
+
+def _apply_flow_active(messages):
+    return _last_bot_flow(messages) == APPLY_FLOW
+
+
+def _apply_offer_pending(messages):
+    return _last_bot_flow(messages) == APPLY_OFFER
+
+
+def _apply_pay_pending(messages):
+    return _last_bot_flow(messages) == APPLY_PAY
+
+
+def _last_bot_widget(messages):
+    """The `widget` payload tagged on the most recent bot turn, or None. Used to recover the
+    permit number + email from the pay card when the user pays."""
+    idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            idx = i
+            break
+    if idx is None or idx == 0 or messages[idx - 1].get("role") != "tool":
+        return None
+    try:
+        return json.loads(messages[idx - 1].get("content") or "{}").get("widget")
+    except (ValueError, TypeError):
+        return None
+
+
+def _declined_offer(text):
+    """True only for a clear 'no' to the apply offer. Anything else (yes, or substantive
+    detail) proceeds into the flow, where leave_flow still handles a real topic change."""
+    t = (text or "").strip().lower()
+    return t.startswith("no") or "no thanks" in t or "not now" in t or "maybe later" in t
 
 
 async def try_apply_answer(request_body):
@@ -598,6 +687,8 @@ async def try_apply_answer(request_body):
     if not PERMIT_APPLY_ENABLED:
         return None
     raw = request_body.get("messages", [])
+    if _flow_family(_last_bot_flow(raw)) not in (None, "apply"):
+        return None                      # a PRR/inspection flow owns this turn
     # The apply agent re-reads the collected fields from the history each turn, so it needs
     # the WHOLE application, not just the last few turns (else early fields like name/email
     # scroll out of the window and it re-asks). ~30 messages covers a full field-by-field
@@ -608,32 +699,66 @@ async def try_apply_answer(request_body):
         return None
     try:
         client = await init_openai_client()
-        if not _apply_flow_active(raw):
-            # not mid-flow -> classify once (cached for permit + index routing to reuse)
-            if await _domain_for(request_body, client) != "instant-permit":
+
+        async def run_agent():
+            result = await apply_agent.answer_apply_query(
+                history, client, app_settings.azure_openai.model)
+            if result.get("left"):    # user changed topic -> fall through, drop the tag
                 return None
-            logging.info("[APPLY AGENT] entering flow: %s", user_query)
-        else:
+            w = result.get("widget")
+            # after submit the agent emits a 'pay' widget -> switch to the pay state so the
+            # NEXT turn is handled as a payment, not more collection.
+            flow = APPLY_PAY if (isinstance(w, dict) and w.get("type") == "pay") else APPLY_FLOW
+            return {"reply": result["reply"], "in_flow": result["in_flow"], "widget": w, "flow": flow}
+
+        # 1) mid-flow -> run the agent, classifier skipped
+        if _apply_flow_active(raw):
             logging.info("[APPLY AGENT] continuing flow (classifier skipped)")
-        result = await apply_agent.answer_apply_query(
-            history, client, app_settings.azure_openai.model)
-        if result.get("left"):        # user changed topic -> fall through, drop the tag
+            return await run_agent()
+
+        # 2) payment step: the pay card was showing and the user tapped Pay (mock). Show the
+        # result card + a note that the receipt/permit were emailed to the address they gave.
+        if _apply_pay_pending(raw):
+            w = _last_bot_widget(raw) or {}
+            pn, email = w.get("permitNumber"), w.get("email")
+            note = f" A receipt and your permit PDF have been emailed to {email}." if email else ""
+            logging.info("[APPLY AGENT] payment received for %s", pn)
+            return {"reply": f"Payment received.{note} You can download your permit below.",
+                    "in_flow": False, "flow": APPLY_FLOW,
+                    "widget": {"type": "result", "permitNumber": pn}}
+
+        # 3) the user is answering the "want help applying?" offer
+        if _apply_offer_pending(raw):
+            if _declined_offer(user_query):
+                logging.info("[APPLY AGENT] offer declined")
+                return {"reply": "No problem. If you change your mind or need anything else, just ask.",
+                        "in_flow": False, "widget": None, "flow": APPLY_FLOW}
+            logging.info("[APPLY AGENT] offer accepted -> entering flow")
+            return await run_agent()
+
+        # 4) fresh message -> classify; on instant-permit intent, OFFER first (no RAG, no collection yet)
+        if await _domain_for(request_body, client) != "instant-permit":
             return None
-        return {"reply": result["reply"], "in_flow": result["in_flow"], "widget": result.get("widget")}
+        logging.info("[APPLY AGENT] offering apply: %s", user_query)
+        offer = ("That requires a permit, and it's one you can file instantly right here. "
+                 "Want me to help you apply now?")
+        return {"reply": offer, "in_flow": True, "flow": APPLY_OFFER,
+                "widget": {"type": "chips", "options": ["Yes, help me apply", "No thanks"]}}
     except Exception:
         logging.exception("apply agent failed; falling back to RAG")
         return None
 
 
-def _apply_messages(reply, in_flow, widget=None):
+def _apply_messages(reply, in_flow, widget=None, flow=APPLY_FLOW):
     """Build choices[0].messages: a tag (tool) message first when in_flow, then the reply.
-    The tool message is how the flow tag round-trips (see _apply_flow_active), and it also
-    carries the interactive `widget` payload for the frontend to render."""
+    The tool message is how the flow tag round-trips (see _last_bot_flow), and it also
+    carries the interactive `widget` payload for the frontend to render. `flow` is the tag
+    value: APPLY_FLOW mid-application, or APPLY_OFFER while the yes/no offer is showing."""
     msgs = []
     if in_flow or widget:
         tag = {}
-        if in_flow:               # 'flow' marks mid-flow so the classifier is skipped next turn
-            tag["flow"] = APPLY_FLOW
+        if in_flow:               # tag marks the state so the classifier is skipped next turn
+            tag["flow"] = flow
         if widget:                # emit the widget even on the final (submitted) turn -> result card
             tag["widget"] = widget
         msgs.append({"role": "tool", "content": json.dumps(tag)})
@@ -641,25 +766,116 @@ def _apply_messages(reply, in_flow, widget=None):
     return msgs
 
 
-def apply_non_streaming_response(reply, in_flow, history_metadata, widget=None):
+def apply_non_streaming_response(reply, in_flow, history_metadata, widget=None, flow=APPLY_FLOW):
     obj = _permit_message_obj()
     obj["id"] = "apply-agent"
-    obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget)
+    obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget, flow)
     obj["history_metadata"] = history_metadata
     obj["apim-request-id"] = "apply-agent"
     return obj
 
 
-def apply_stream_response(reply, in_flow, history_metadata, widget=None):
+def apply_stream_response(reply, in_flow, history_metadata, widget=None, flow=APPLY_FLOW):
     async def generate():
         obj = _permit_message_obj()
         obj["id"] = "apply-agent"
         obj["object"] = "extensions.chat.completion.chunk"
-        obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget)
+        obj["choices"][0]["messages"] = _apply_messages(reply, in_flow, widget, flow)
         obj["history_metadata"] = history_metadata
         obj["apim-request-id"] = "apply-agent"
         yield obj
     return generate()
+
+
+# --- Mock flows: public-record request (offer -> form window) + inspection (conversational) --
+def detect_prr_query(query):
+    """Explicit public-records intent only, so normal questions aren't hijacked."""
+    if not query or not isinstance(query, str):
+        return False
+    q = query.lower()
+    if "prr" in re.split(r"\W+", q):                 # standalone 'prr' token
+        return True
+    return "public record" in q or "records request" in q
+
+
+_INSPECTION_VERBS = ("schedule", "reschedule", "book", "move", "set up", "arrange")
+
+
+def detect_inspection_query(query):
+    """Require an inspection noun AND an action verb, so 'what inspections do I need' is ignored."""
+    if not query or not isinstance(query, str):
+        return False
+    q = query.lower()
+    if "inspection" not in q and "inspector" not in q:
+        return False
+    return any(v in q for v in _INSPECTION_VERBS)
+
+
+async def try_prr_answer(request_body):
+    """Public-record request flow: keyword -> offer -> single form window -> review -> mock ref."""
+    if not MOCK_FLOWS_ENABLED:
+        return None
+    raw = request_body.get("messages", [])
+    if _flow_family(_last_bot_flow(raw)) not in (None, "prr"):
+        return None
+    history = _recent_history(raw, turns=30)
+    user_query = _latest_user_query(raw)
+    if not user_query:
+        return None
+    try:
+        client = await init_openai_client()
+
+        async def run_agent():
+            result = await prr_agent.answer_prr_query(history, client, app_settings.azure_openai.model)
+            if result.get("left"):
+                return None
+            return {"reply": result["reply"], "in_flow": result["in_flow"],
+                    "widget": result.get("widget"), "flow": PRR_FLOW}
+
+        if _last_bot_flow(raw) == PRR_FLOW:              # mid-flow: run the agent
+            return await run_agent()
+        if _last_bot_flow(raw) == PRR_OFFER:             # answering the offer
+            if _declined_offer(user_query):
+                return {"reply": "No problem. If you change your mind or need anything else, just ask.",
+                        "in_flow": False, "widget": None, "flow": PRR_FLOW}
+            return await run_agent()
+        if not detect_prr_query(user_query):             # fresh: offer before the form
+            return None
+        logging.info("[PRR AGENT] offering: %s", user_query)
+        offer = ("I can help you submit a public records request right here. "
+                 "Want me to start one for you?")
+        return {"reply": offer, "in_flow": True, "flow": PRR_OFFER,
+                "widget": {"type": "chips", "options": ["Yes, help me", "No thanks"]}}
+    except Exception:
+        logging.exception("prr agent failed; falling back to RAG")
+        return None
+
+
+async def try_inspection_answer(request_body):
+    """Inspection flow: keyword -> conversational schedule/reschedule -> mock confirmation."""
+    if not MOCK_FLOWS_ENABLED:
+        return None
+    raw = request_body.get("messages", [])
+    if _flow_family(_last_bot_flow(raw)) not in (None, "inspection"):
+        return None
+    history = _recent_history(raw, turns=30)
+    user_query = _latest_user_query(raw)
+    if not user_query:
+        return None
+    if _last_bot_flow(raw) != INSPECTION_FLOW and not detect_inspection_query(user_query):
+        return None
+    try:
+        client = await init_openai_client()
+        logging.info("[INSPECTION AGENT] handling: %s", user_query)
+        result = await inspection_agent.answer_inspection_query(
+            history, client, app_settings.azure_openai.model)
+        if result.get("left"):
+            return None
+        return {"reply": result["reply"], "in_flow": result["in_flow"],
+                "widget": result.get("widget"), "flow": INSPECTION_FLOW}
+    except Exception:
+        logging.exception("inspection agent failed; falling back to RAG")
+        return None
 
 
 # Offer-the-apply-chip: when a normal RAG answer is about one of the five instant-permit
@@ -761,10 +977,24 @@ async def complete_chat_request(request_body, request_headers):
         apply_answer = await try_apply_answer(request_body)
         if apply_answer is not None:
             return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"],
-                                                history_metadata, apply_answer.get("widget"))
+                                                history_metadata, apply_answer.get("widget"),
+                                                apply_answer.get("flow", APPLY_FLOW))
+        prr_answer = await try_prr_answer(request_body)
+        if prr_answer is not None:
+            return apply_non_streaming_response(prr_answer["reply"], prr_answer["in_flow"],
+                                                history_metadata, prr_answer.get("widget"),
+                                                prr_answer.get("flow", PRR_FLOW))
+        inspection_answer = await try_inspection_answer(request_body)
+        if inspection_answer is not None:
+            return apply_non_streaming_response(inspection_answer["reply"], inspection_answer["in_flow"],
+                                                history_metadata, inspection_answer.get("widget"),
+                                                inspection_answer.get("flow", INSPECTION_FLOW))
         permit_answer = await try_permit_answer(request_body)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
+        meetings_answer = await try_meetings_answer(request_body)
+        if meetings_answer is not None:
+            return permit_non_streaming_response(meetings_answer, history_metadata)
         # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
         job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
             if PERMIT_APPLY_ENABLED else None
@@ -780,10 +1010,24 @@ async def stream_chat_request(request_body, request_headers):
     apply_answer = await try_apply_answer(request_body)
     if apply_answer is not None:
         return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"],
-                                     history_metadata, apply_answer.get("widget"))
+                                     history_metadata, apply_answer.get("widget"),
+                                     apply_answer.get("flow", APPLY_FLOW))
+    prr_answer = await try_prr_answer(request_body)
+    if prr_answer is not None:
+        return apply_stream_response(prr_answer["reply"], prr_answer["in_flow"],
+                                     history_metadata, prr_answer.get("widget"),
+                                     prr_answer.get("flow", PRR_FLOW))
+    inspection_answer = await try_inspection_answer(request_body)
+    if inspection_answer is not None:
+        return apply_stream_response(inspection_answer["reply"], inspection_answer["in_flow"],
+                                     history_metadata, inspection_answer.get("widget"),
+                                     inspection_answer.get("flow", INSPECTION_FLOW))
     permit_answer = await try_permit_answer(request_body)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
+    meetings_answer = await try_meetings_answer(request_body)
+    if meetings_answer is not None:
+        return permit_stream_response(meetings_answer, history_metadata)
     # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
     job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
         if PERMIT_APPLY_ENABLED else None

@@ -20,11 +20,17 @@ Entry point:
 
 import json
 import logging
+import os
 import re
 
 from backend.permit_agent import apply_client as api
 
 MAX_STEPS = 5
+
+# New installations are NOT instant-filable; the flow redirects them here. City-specific
+# and must be VERIFIED before go-live, set BUILDING_SAFETY_CONTACT in env to the real
+# office (e.g. "Building & Safety at (555) 123-4567 or permits@city.gov").
+BUILDING_SAFETY_CONTACT = os.environ.get("BUILDING_SAFETY_CONTACT", "the city's Building & Safety office")
 
 # Friendly work-type -> MEPP subTypeId (mirrors apply_client.MEPP_SUBTYPES).
 WORK_TYPES = {
@@ -41,6 +47,10 @@ How you work, every single turn:
 1. FIRST call set_fields with EVERY value you have gathered from the whole conversation so far (omit what you don't have yet). Figure out the work type from the user's words (e.g. "my water heater broke" -> Water Heater Replacement). Use only what the user actually said; never invent a value.
 2. The tool result tells you what is still needed. Then write ONE short, friendly line asking for just that next item. Do NOT list all the fields, an on-screen widget handles the input, so keep your message to a single prompt.
 
+Eligibility (very important):
+- Instant permits cover REPLACEMENTS of an existing unit only, NOT brand-new installations. Right after the work type, confirm this and report it in set_fields as `replacement` ("replacement" for replacing an existing unit, "new" for a new installation). Map the buttons "Replacing existing" -> replacement and "New installation" -> new.
+- If it is a new installation, the tool result will tell you it is ineligible; deliver that redirect message and stop. Do not collect any more fields.
+
 Other rules:
 - The system shows the review with the fee automatically once everything is collected. When it does, the user replies CONFIRM; then call submit_application with all the values. Never claim it is submitted yourself.
 - Instant online filing covers ONLY those five jobs. If the user wants a permit that is NOT one of them, briefly say instant filing covers only those five and point them to the city's permit page or the permit office. Do NOT call leave_flow for that.
@@ -54,6 +64,8 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "work_type": {"type": "string", "enum": ["HVAC", "House Rewire", "Panel Upgrade",
                           "Water Heater Replacement", "House Repipe"]},
+            "replacement": {"type": "string", "enum": ["replacement", "new"],
+                            "description": "'replacement' if the job replaces an existing unit, 'new' if it is a brand-new installation. Map button 'Replacing existing' -> replacement, 'New installation' -> new."},
             "property_address": {"type": "string"},
             "name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"},
             "valuation": {"type": "number", "description": "estimated job cost in dollars"},
@@ -101,6 +113,17 @@ async def handle_set_fields(a):
         return {"need": "work_type",
                 "_widget": {"type": "chips", "field": "work_type", "options": list(WORK_TYPES)},
                 "message": "Ask which of the five jobs it is; they can tap it."}
+    # Eligibility gate: instant permits are replacement-only. Ask before collecting anything else.
+    if a.get("replacement") not in ("replacement", "new"):
+        return {"need": "replacement",
+                "_widget": {"type": "chips", "field": "replacement",
+                            "options": ["Replacing existing", "New installation"]},
+                "message": "Ask whether this replaces an existing unit or is a new installation; they can tap it."}
+    if a.get("replacement") == "new":
+        return {"status": "ineligible",
+                "message": ("Tell the user that instant permits cover replacements only, and that for a "
+                            f"brand-new installation they should contact {BUILDING_SAFETY_CONTACT}. "
+                            "Then stop and do not collect anything else.")}
     if not str(a.get("property_address", "")).strip():
         return {"need": "address",
                 "_widget": {"type": "address_autocomplete", "field": "property_address"},
@@ -208,8 +231,10 @@ async def handle_submit(a, user_confirmed):
         return {"status": "submit_failed", "api_message": result.get("message"),
                 "message": "The permit could NOT be created. Tell the user the submission "
                            "failed and to try again shortly; do not claim it succeeded."}
+    fee = await api.fee_estimate(a)
     return {"status": "submitted", "permitNumber": pn, "mock": result.get("mock", False),
-            "message": "Permit created. Tell the user the permit number and that they finish by paying the fee on the city portal."}
+            "fee": fee.get("totalFee"),
+            "message": "Permit created. Tell the user the permit number and that the last step is to pay the fee shown below."}
 
 
 def _user_confirmed(history):
@@ -241,6 +266,7 @@ async def answer_apply_query(history, client, model):
     messages = [{"role": "system", "content": SYSTEM}] + list(history)
     left = False
     submitted = False
+    ended = False          # eligibility gate (new installation) ended the flow this turn
     widget = None
     for _ in range(MAX_STEPS):
         resp = await client.chat.completions.create(
@@ -248,7 +274,7 @@ async def answer_apply_query(history, client, model):
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         if not msg.tool_calls:
-            return {"reply": msg.content or "", "in_flow": not (left or submitted),
+            return {"reply": msg.content or "", "in_flow": not (left or submitted or ended),
                     "left": left, "widget": widget}
         for tc in msg.tool_calls:
             try:
@@ -259,11 +285,15 @@ async def answer_apply_query(history, client, model):
                 result = {"error": str(e)}
             if isinstance(result, dict) and "_widget" in result:
                 widget = result.pop("_widget")           # code-decided widget (set_fields)
+            if isinstance(result, dict) and result.get("status") == "ineligible":
+                ended = True                              # new install: redirect + end the flow
             if tc.function.name == "leave_flow":
                 left = True
             if tc.function.name == "submit_application" and result.get("status") == "submitted":
-                submitted = True
-                widget = {"type": "result", "permitNumber": result.get("permitNumber")}
+                # Emit the PAY step and STAY in the flow (do not set submitted). Payment is a
+                # mock handled next turn in app.py, which then shows the result card.
+                widget = {"type": "pay", "permitNumber": result.get("permitNumber"),
+                          "amount": result.get("fee"), "email": args.get("email")}
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
         if left:  # stop the loop immediately; the turn falls through to normal routing
             return {"reply": "", "in_flow": False, "left": True, "widget": None}

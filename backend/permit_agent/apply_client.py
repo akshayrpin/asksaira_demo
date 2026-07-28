@@ -44,10 +44,84 @@ PERMIT_CODES = {"permitType": "MEPP", "actTypeId": 1, "applicant_peopleTypeId": 
 
 
 def use_mock():
-    """Mock the fee + submit if asked to, or whenever the codes aren't filled yet."""
+    """Mock the whole write-side (address, fee, submit, PDF) if asked to, or whenever the
+    codes aren't filled yet. Set PERMIT_APPLY_MOCK=1 to run the flow end-to-end with no calls
+    to the :9080 permit API (used while getToken is down)."""
     codes = PERMIT_CODES
     ready = codes.get("permitType") and codes.get("actTypeId") and codes.get("applicant_peopleTypeId")
     return MOCK or not ready
+
+
+# A few realistic Burbank addresses so the type-ahead still feels real in mock mode. The
+# query filters these exactly like the live list; if nothing matches we synthesize one from
+# what was typed so the flow never dead-ends.
+_MOCK_ADDRESSES = [
+    "275 E Olive Ave, Burbank CA 91502",
+    "301 E Olive Ave, Burbank CA 91502",
+    "150 N Third St, Burbank CA 91502",
+    "164 W Magnolia Blvd, Burbank CA 91502",
+    "141 N Glenoaks Blvd, Burbank CA 91502",
+    "1111 W Olive Ave, Burbank CA 91506",
+    "2000 W Olive Ave, Burbank CA 91506",
+    "635 N Hollywood Way, Burbank CA 91505",
+]
+
+
+def _mock_lso(address):
+    """Deterministic non-'-1' id so a selected mock address behaves like a real one."""
+    return "MOCK-" + hashlib.sha1(address.encode()).hexdigest()[:8].upper()
+
+
+def _mock_search(query, limit):
+    nq = _norm(query)
+    if len(nq) < 2:
+        return []
+    prefix = [a for a in _MOCK_ADDRESSES if _norm(a).startswith(nq)]
+    contains = [a for a in _MOCK_ADDRESSES if nq in _norm(a) and a not in prefix]
+    hits = prefix + contains
+    if not hits:  # echo what they typed, cleaned up, so selection still works
+        typed = " ".join(w.capitalize() for w in str(query).split())
+        hits = [f"{typed}, Burbank CA 91502"]
+    return [{"address": a, "lsoId": _mock_lso(a), "apn": "000-000-000"} for a in hits[:limit]]
+
+
+def _mock_pdf(act_nbr):
+    """Build a minimal, valid one-page PDF for the download button in mock mode."""
+    text_lines = [
+        "CITY OF BURBANK  -  INSTANT PERMIT (DEMONSTRATION)",
+        "",
+        f"Permit Number: {act_nbr}",
+        "Type: MEPP Instant Permit",
+        "Status: Issued",
+        "",
+        "This is a mock permit generated for demonstration purposes.",
+        "No official city record has been created.",
+    ]
+    parts = ["BT", "/F1 14 Tf", "72 720 Td", "18 TL"]
+    for ln in text_lines:
+        safe = ln.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        parts += [f"({safe}) Tj", "T*"]
+    parts.append("ET")
+    stream = "\n".join(parts).encode("latin-1")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+    xref_pos = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF" % (len(objs) + 1, xref_pos)
+    return out
 
 
 _token = {"value": None, "at": 0.0}
@@ -109,6 +183,9 @@ async def validate_address(address):
     validateAddress is finicky (returns the sentinel for many valid addresses), so we fall
     back to a normalized match against the full getAllAddresses list, exact first, then
     startswith, both case/whitespace-insensitive."""
+    if use_mock():
+        cleaned = " ".join(w.capitalize() for w in str(address).split())
+        return [{"lsoId": _mock_lso(cleaned), "address": cleaned, "apn": "000-000-000"}]
     async with aiohttp.ClientSession() as s:
         data = await _request(s, "GET", "validateAddress", params={"address": address})
         matches = [m for m in (data.get("address") or []) if _real(m)]
@@ -133,6 +210,8 @@ async def search_addresses(query, limit=8):
     Returns [{address, lsoId, apn}]; empty for queries under 2 chars. Selecting a result
     hands the caller a guaranteed-valid lsoId, so no follow-up validateAddress is needed.
     """
+    if use_mock():
+        return _mock_search(query, limit)
     nq = _norm(query)
     if len(nq) < 2:
         return []
@@ -173,8 +252,9 @@ async def add_permit(app):
     """Create the permit via addPermit (AddActivity). Placeholder when in mock mode.
     Returns {permitNumber, ...}."""
     if use_mock():
-        suffix = hashlib.sha1(app["property_address"].encode()).hexdigest()[:6].upper()
-        return {"permitNumber": f"MEPP-MOCK-{suffix}", "status": True, "mock": True}
+        key = app.get("property_address") or app.get("address") or "permit"
+        n = int(hashlib.sha1(str(key).encode()).hexdigest(), 16) % 100000
+        return {"permitNumber": f"MEPP-2026-{n:05d}", "status": True, "mock": True}
     body = {
         "actTypeId": PERMIT_CODES["actTypeId"],
         "description": app["description"], "lsoId": app["lsoId"],
@@ -193,6 +273,8 @@ async def add_permit(app):
 
 async def permit_report(act_nbr):
     """Fetch the permit PDF (bytes) from getPermitReport, for the download button."""
+    if use_mock():
+        return _mock_pdf(act_nbr)
     async with aiohttp.ClientSession() as s:
         token = await _get_token(s)
         async with s.get(f"{BASE}/getPermitReport", params={"actNbr": act_nbr},
