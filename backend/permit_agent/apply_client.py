@@ -262,7 +262,7 @@ async def add_permit(app):
         "subTypeIds": [{"subTypeId": app["subTypeId"]}],
         "people": [{
             "name": app["name"], "emailAddress": app["email"], "phoneNbr": app["phone"],
-            "address": app.get("property_address", ""), "city": app.get("city", "Buena Park"),
+            "address": app.get("property_address", ""), "city": app.get("city", "Burbank"),
             "state": app.get("state", "CA"), "zipCode": app.get("zip", ""),
             "peopleTypeId": PERMIT_CODES["applicant_peopleTypeId"], "title": "Applicant",
         }],

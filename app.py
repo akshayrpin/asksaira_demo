@@ -698,6 +698,36 @@ def _declined_offer(text):
     return t.startswith("no") or "no thanks" in t or "not now" in t or "maybe later" in t
 
 
+APPLY_OFFER_SYSTEM = (
+    "You are the City's permit assistant, in a chat. The resident just described a home problem "
+    "or project that needs an over-the-counter permit they can file instantly, right here in this "
+    "chat. Write a SHORT (about 2 sentences, ~40 words), warm, guiding reply that:\n"
+    "1) briefly acknowledges their situation,\n"
+    "2) states plainly that the work itself (for example, replacing their water heater or "
+    "upgrading their electrical panel) requires a permit,\n"
+    "3) reassures them it is one they can file instantly right here, and\n"
+    "4) offers to help them apply now, ending with a question.\n"
+    "Name the specific item from their message. Do not list steps or fields. Be conversational "
+    "and helpful, never robotic."
+)
+
+
+async def _apply_offer_text(history, client, model):
+    """LLM-written apply offer: names the specific job, states it needs a permit, offers to help.
+    Falls back to a fixed line if the model call fails or returns nothing."""
+    try:
+        msgs = [{"role": "system", "content": APPLY_OFFER_SYSTEM}] + list(history)
+        resp = await client.chat.completions.create(
+            model=model, messages=msgs, temperature=0.5, max_tokens=90)
+        text = (resp.choices[0].message.content or "").strip()
+        if text:
+            return text
+    except Exception:
+        logging.exception("apply offer generation failed; using fallback")
+    return ("That work requires a permit, and it's one you can file instantly right here. "
+            "Want me to help you apply now?")
+
+
 async def try_apply_answer(request_body):
     """Drive the instant-permit apply flow. Returns None to fall through to normal routing,
     otherwise {"reply": str, "in_flow": bool}. We skip the classifier when already mid-flow."""
@@ -757,8 +787,7 @@ async def try_apply_answer(request_body):
         if await _domain_for(request_body, client) != "instant-permit":
             return None
         logging.info("[APPLY AGENT] offering apply: %s", user_query)
-        offer = ("That requires a permit, and it's one you can file instantly right here. "
-                 "Want me to help you apply now?")
+        offer = await _apply_offer_text(history, client, app_settings.azure_openai.model)
         return {"reply": offer, "in_flow": True, "flow": APPLY_OFFER,
                 "widget": {"type": "chips", "options": ["Yes, help me apply", "No thanks"]}}
     except Exception:
