@@ -26,8 +26,11 @@ USERNAME = os.environ.get("PERMIT_APPLY_USERNAME", "symbium")
 PASSWORD = os.environ.get("PERMIT_APPLY_PASSWORD", "symbium1")
 TIMEOUT = 25
 
-# Force placeholder fee + submit with PERMIT_APPLY_MOCK=1 (also auto-mocks if codes blank).
+# Force placeholder submit with PERMIT_APPLY_MOCK=1 (also auto-mocks if codes blank).
 MOCK = os.environ.get("PERMIT_APPLY_MOCK", "0") != "0"
+
+# The permit fee is a flat $66.50 for the demo, never fetched from the API's feeEstimate.
+FLAT_FEE = 66.50
 
 # MEPP (Mechanical/Electrical/Plumbing) instant permits, confirmed against the :9080 API.
 # feeEstimate takes the string permitType "MEPP"; addPermit takes the integer actTypeId 1.
@@ -233,19 +236,11 @@ async def search_addresses(query, limit=8):
 
 
 async def fee_estimate(app):
-    """Estimate the permit fee. Placeholder when in mock mode. feeEstimate uses the
-    string permitType ('MEPP') plus the picked subTypeId."""
-    if use_mock():
-        return {"totalFee": 220.00, "feeDetails": [{"feeDescription": "MEPP permit (placeholder)", "feeAmount": 220.00}],
-                "mock": True}
-    form = {
-        "permitType": PERMIT_CODES["permitType"],
-        "subTypeIds": [{"subTypeId": app["subTypeId"]}],
-        "unit": app.get("unit", 1),
-        "valuation": app["valuation"], "peopleId": app.get("peopleId", 0),
-    }
-    async with aiohttp.ClientSession() as s:
-        return await _request(s, "POST", "feeEstimate", json_body=form)
+    """Return the fixed demo permit fee. The fee is a flat $66.50 and is NOT fetched from the
+    API's feeEstimate, in either mock or real mode."""
+    return {"totalFee": FLAT_FEE,
+            "feeDetails": [{"feeDescription": "Permit fee", "feeAmount": FLAT_FEE}],
+            "mock": use_mock()}
 
 
 async def add_permit(app):

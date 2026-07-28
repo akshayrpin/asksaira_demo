@@ -411,16 +411,17 @@ ROUTER_SYSTEM_MESSAGE = (
     "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
     "city services, news, events, FAQs, general how-to questions, AND how to apply for or "
     "pay for a permit, permit fees, what documents are needed, which permit you need for a "
-    "project, what permit types the city offers in general, and Building & Safety info.\n"
-    "- instant-permit: the user wants to ACTUALLY APPLY for / start / file / submit a permit "
-    "application right now (e.g. 'I want to apply for a solar permit', 'help me file a solar "
-    "permit', 'start my permit application'). ALSO classify as instant-permit when the resident "
-    "reports that one of these is broken, failing, at end of life, or needs replacing, because "
-    "the assistant can file the replacement permit: water heater, furnace or air "
-    "conditioner/HVAC, electrical panel, house wiring (rewire), or water piping (repipe). "
-    "Examples: 'my water heater is broken', 'I need to replace my electrical panel', 'my "
-    "furnace died', 'time to repipe the house'. This is the transactional apply flow, NOT a "
-    "how-to question (website) and NOT looking up existing records (permit).\n"
+    "project, what permit types the city offers in general, and Building & Safety info. "
+    "EXCEPTION: any question about the five instant-permit jobs (water heater, HVAC/furnace/AC, "
+    "electrical panel, rewire, repipe) is instant-permit, not website.\n"
+    "- instant-permit: use this for ANY question about one of these five specific jobs, no "
+    "matter how it is phrased, whether the user wants to apply, reports a problem, or just asks "
+    "about the permit for it: water heater, furnace or air conditioner/HVAC, electrical panel, "
+    "house wiring (rewire), or water piping (repipe). This INCLUDES informational questions "
+    "about these five, such as 'do I need a permit for water heater replacement', 'how do I "
+    "permit a panel upgrade', 'my furnace died', 'I want to apply for a water heater permit'. "
+    "For these five jobs ALWAYS choose instant-permit, even over website. This is the "
+    "transactional apply flow, NOT looking up existing records (permit).\n"
     "- public-record: the user wants to FILE / submit / start a public records request (CPRA). "
     "The abbreviation 'PRR' means public records request. Examples: 'I want to apply for a PRR', "
     "'submit a public records request', 'I need copies of city records'. This is a transactional "
@@ -926,49 +927,6 @@ async def try_inspection_answer(request_body):
         return None
 
 
-# Offer-the-apply-chip: when a normal RAG answer is about one of the five instant-permit
-# jobs, we staple a "start the application" chip under it. This is NOT a routing decision.
-# The question still goes down the normal RAG path; the chip only posts an apply message
-# (entering the existing flow) if the user taps it. Deterministic keyword match, no LLM call.
-# Job strings must equal apply_agent.WORK_TYPES keys so set_fields resolves the work type.
-# Water heater is listed first so "heat pump water heater" resolves to the heater, not HVAC.
-_JOB_KEYWORDS = [
-    ("Water Heater Replacement", ("water heater", "hot water heater", "water-heater")),
-    ("HVAC", ("hvac", "furnace", "air conditioning", "air conditioner", "ac unit", "heat pump", "central air")),
-    ("Panel Upgrade", ("panel upgrade", "electrical panel", "service panel", "breaker panel", "sub panel", "subpanel", "main panel")),
-    ("House Rewire", ("rewire", "re-wire", "house wiring", "rewiring")),
-    ("House Repipe", ("repipe", "re-pipe", "replumb", "re-plumb", "house piping")),
-]
-
-
-def detect_instant_permit_job(query):
-    """Return the WORK_TYPES display name if the query is about one of the five jobs, else None."""
-    if not query or not isinstance(query, str):
-        return None
-    q = query.lower()
-    for job, kws in _JOB_KEYWORDS:
-        if any(k in q for k in kws):
-            return job
-    return None
-
-
-def _merge_apply_chip(formatted, job):
-    """Merge an 'Apply for a <job> permit' chip into the citations tool message of a RAG
-    response so the frontend renders it under the answer (same tool-tag channel the apply
-    flow uses). No-op when this object/chunk carries no tool message (e.g. abstentions)."""
-    widget = {"type": "chips", "options": [f"Apply for a {job} permit"]}
-    for m in formatted.get("choices", [{}])[0].get("messages", []):
-        if m.get("role") == "tool" and isinstance(m.get("content"), str):
-            try:
-                data = json.loads(m["content"])
-            except (ValueError, TypeError):
-                data = {}
-            if isinstance(data, dict):
-                data["widget"] = widget
-                m["content"] = json.dumps(data)
-    return formatted
-
-
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -1045,14 +1003,8 @@ async def complete_chat_request(request_body, request_headers):
         meetings_answer = await try_meetings_answer(request_body)
         if meetings_answer is not None:
             return permit_non_streaming_response(meetings_answer, history_metadata)
-        # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
-        job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
-            if PERMIT_APPLY_ENABLED else None
         response, apim_request_id = await send_chat_request(request_body, request_headers)
-        rag = format_non_streaming_response(response, history_metadata, apim_request_id)
-        if job:
-            _merge_apply_chip(rag, job)
-        return rag
+        return format_non_streaming_response(response, history_metadata, apim_request_id)
 
 
 async def stream_chat_request(request_body, request_headers):
@@ -1079,9 +1031,6 @@ async def stream_chat_request(request_body, request_headers):
     meetings_answer = await try_meetings_answer(request_body)
     if meetings_answer is not None:
         return permit_stream_response(meetings_answer, history_metadata)
-    # Detect the job BEFORE send_chat_request (it filters/reassigns request_body messages).
-    job = detect_instant_permit_job(_latest_user_query(request_body.get("messages", []))) \
-        if PERMIT_APPLY_ENABLED else None
     response, apim_request_id = await send_chat_request(request_body, request_headers)
 
     async def generate():
@@ -1100,8 +1049,6 @@ async def stream_chat_request(request_body, request_headers):
                 if getattr(delta, "content", None):
                     full_response.append(delta.content)
             formatted = format_stream_response(completionChunk, history_metadata, apim_request_id)
-            if job:                       # merge the chip into the citations tool chunk
-                _merge_apply_chip(formatted, job)
             yield formatted
         if full_response:
             logging.info(f"[OPENAI RESPONSE] {''.join(full_response)}")
