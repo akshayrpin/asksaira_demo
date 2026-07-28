@@ -406,15 +406,28 @@ INDEX_ROUTING_ENABLED = bool(PERMITS_INDEX and CODES_INDEX)
 
 ROUTER_SYSTEM_MESSAGE = (
     "You route a resident's question for a city government assistant to ONE data source. "
-    "Reply with exactly one lowercase word: website, permit, instant-permit, or codes.\n"
+    "Reply with exactly one lowercase word: website, permit, instant-permit, public-record, "
+    "inspection, or codes.\n"
     "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
     "city services, news, events, FAQs, general how-to questions, AND how to apply for or "
     "pay for a permit, permit fees, what documents are needed, which permit you need for a "
     "project, what permit types the city offers in general, and Building & Safety info.\n"
     "- instant-permit: the user wants to ACTUALLY APPLY for / start / file / submit a permit "
     "application right now (e.g. 'I want to apply for a solar permit', 'help me file a solar "
-    "permit', 'start my permit application'). This is the transactional apply flow, NOT a "
+    "permit', 'start my permit application'). ALSO classify as instant-permit when the resident "
+    "reports that one of these is broken, failing, at end of life, or needs replacing, because "
+    "the assistant can file the replacement permit: water heater, furnace or air "
+    "conditioner/HVAC, electrical panel, house wiring (rewire), or water piping (repipe). "
+    "Examples: 'my water heater is broken', 'I need to replace my electrical panel', 'my "
+    "furnace died', 'time to repipe the house'. This is the transactional apply flow, NOT a "
     "how-to question (website) and NOT looking up existing records (permit).\n"
+    "- public-record: the user wants to FILE / submit / start a public records request (CPRA). "
+    "The abbreviation 'PRR' means public records request. Examples: 'I want to apply for a PRR', "
+    "'submit a public records request', 'I need copies of city records'. This is a transactional "
+    "request flow, NOT a permit.\n"
+    "- inspection: the user wants to SCHEDULE, book, reschedule, or move a building INSPECTION "
+    "for a permit. Examples: 'schedule an inspection', 'reschedule my final inspection', 'move my "
+    "inspection to Thursday'. NOT a question about which inspections are required (that is website).\n"
     "- permit: looking up SPECIFIC existing permit records, their status, or any COUNT, "
     "BREAKDOWN, LIST, or RANKING of permits actually filed or issued (this also covers "
     "business tax registrations and business licenses). Includes breakdowns by type, "
@@ -460,6 +473,10 @@ async def classify_domain(user_query, client, history=None):
         return "website"
     if "instant" in label:          # check before "permit" ('instant-permit' contains it)
         return "instant-permit"
+    if "inspect" in label:
+        return "inspection"
+    if "record" in label or "public" in label:
+        return "public-record"
     if "permit" in label:
         return "permit"
     if "code" in label:
@@ -839,7 +856,8 @@ async def try_prr_answer(request_body):
                 return {"reply": "No problem. If you change your mind or need anything else, just ask.",
                         "in_flow": False, "widget": None, "flow": PRR_FLOW}
             return await run_agent()
-        if not detect_prr_query(user_query):             # fresh: offer before the form
+        # fresh: keyword OR the classifier must say public-record, then offer before the form
+        if not detect_prr_query(user_query) and await _domain_for(request_body, client) != "public-record":
             return None
         logging.info("[PRR AGENT] offering: %s", user_query)
         offer = ("I can help you submit a public records request right here. "
@@ -862,10 +880,11 @@ async def try_inspection_answer(request_body):
     user_query = _latest_user_query(raw)
     if not user_query:
         return None
-    if _last_bot_flow(raw) != INSPECTION_FLOW and not detect_inspection_query(user_query):
-        return None
     try:
         client = await init_openai_client()
+        if _last_bot_flow(raw) != INSPECTION_FLOW:       # fresh: keyword OR classifier must say inspection
+            if not detect_inspection_query(user_query) and await _domain_for(request_body, client) != "inspection":
+                return None
         logging.info("[INSPECTION AGENT] handling: %s", user_query)
         result = await inspection_agent.answer_inspection_query(
             history, client, app_settings.azure_openai.model)
@@ -974,11 +993,8 @@ async def complete_chat_request(request_body, request_headers):
         )
     else:
         history_metadata = request_body.get("history_metadata", {})
-        apply_answer = await try_apply_answer(request_body)
-        if apply_answer is not None:
-            return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"],
-                                                history_metadata, apply_answer.get("widget"),
-                                                apply_answer.get("flow", APPLY_FLOW))
+        # Keyword-triggered mock flows first: their detection is specific, and 'apply for a
+        # prr' would otherwise pattern-match the instant-permit classifier and get hijacked.
         prr_answer = await try_prr_answer(request_body)
         if prr_answer is not None:
             return apply_non_streaming_response(prr_answer["reply"], prr_answer["in_flow"],
@@ -989,6 +1005,11 @@ async def complete_chat_request(request_body, request_headers):
             return apply_non_streaming_response(inspection_answer["reply"], inspection_answer["in_flow"],
                                                 history_metadata, inspection_answer.get("widget"),
                                                 inspection_answer.get("flow", INSPECTION_FLOW))
+        apply_answer = await try_apply_answer(request_body)
+        if apply_answer is not None:
+            return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"],
+                                                history_metadata, apply_answer.get("widget"),
+                                                apply_answer.get("flow", APPLY_FLOW))
         permit_answer = await try_permit_answer(request_body)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
@@ -1007,11 +1028,7 @@ async def complete_chat_request(request_body, request_headers):
 
 async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
-    apply_answer = await try_apply_answer(request_body)
-    if apply_answer is not None:
-        return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"],
-                                     history_metadata, apply_answer.get("widget"),
-                                     apply_answer.get("flow", APPLY_FLOW))
+    # Keyword-triggered mock flows first (see complete_chat_request note).
     prr_answer = await try_prr_answer(request_body)
     if prr_answer is not None:
         return apply_stream_response(prr_answer["reply"], prr_answer["in_flow"],
@@ -1022,6 +1039,11 @@ async def stream_chat_request(request_body, request_headers):
         return apply_stream_response(inspection_answer["reply"], inspection_answer["in_flow"],
                                      history_metadata, inspection_answer.get("widget"),
                                      inspection_answer.get("flow", INSPECTION_FLOW))
+    apply_answer = await try_apply_answer(request_body)
+    if apply_answer is not None:
+        return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"],
+                                     history_metadata, apply_answer.get("widget"),
+                                     apply_answer.get("flow", APPLY_FLOW))
     permit_answer = await try_permit_answer(request_body)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
