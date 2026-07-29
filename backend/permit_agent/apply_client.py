@@ -273,14 +273,15 @@ async def add_permit(app):
 
 
 async def permit_report(act_nbr, meta=None):
-    """Fetch the permit PDF (bytes) from getPermitReport, for the download button. In mock mode
-    build the styled Burbank permit from `meta` if permit_pdf is present, else the simple stub."""
+    """Permit PDF for the download button. The styled Burbank permit is used in BOTH mock and
+    real mode (we never want the external system's own document). If permit_pdf is deleted, mock
+    falls back to the simple stub and real falls back to the API's getPermitReport."""
+    if permit_pdf is not None:
+        try:
+            return permit_pdf.build_permit_pdf(act_nbr, meta or {})
+        except Exception:
+            logging.exception("styled permit pdf failed; falling back")
     if use_mock():
-        if permit_pdf is not None:
-            try:
-                return permit_pdf.build_permit_pdf(act_nbr, meta or {})
-            except Exception:
-                logging.exception("styled permit pdf failed; using simple stub")
         return _mock_pdf(act_nbr)
     async with aiohttp.ClientSession() as s:
         token = await _get_token(s)
