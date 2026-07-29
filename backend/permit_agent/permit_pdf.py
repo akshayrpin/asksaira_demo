@@ -13,6 +13,7 @@ mock: a small "DEMONSTRATION" marker is stamped so it can't be mistaken for an o
 
 import datetime
 import io
+import os
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -78,12 +79,21 @@ def _fmt_money(v):
         return "$ 0.00"
 
 
+_SEAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "burbank_seal.png")
+
+
 def _draw_header(canvas, doc):
-    """Fixed top-of-page: department block (left), barcode + permit meta (right), demo marker."""
+    """Fixed top-of-page: city seal + department block (left), barcode + permit meta (right)."""
     c = canvas
     W, H = letter
     c.saveState()
-    x = 50
+    if os.path.exists(_SEAL):
+        try:
+            c.drawImage(_SEAL, 48, H - 90, width=48, height=50,
+                        mask="auto", preserveAspectRatio=True)
+        except Exception:
+            pass
+    x = 108
     c.setFont("Helvetica-Bold", 10)
     c.drawString(x, H - 46, "Community Development Department")
     c.drawString(x, H - 58, "BUILDING & SAFETY DIVISION")

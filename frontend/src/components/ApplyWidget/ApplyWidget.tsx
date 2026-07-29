@@ -55,6 +55,9 @@ const primaryBtn: React.CSSProperties = {
   background: '#0f6cbd', color: '#fff', cursor: 'pointer', fontSize: 15, fontWeight: 600
 }
 
+// Money always shows two decimals, so a fee reads "$66.50", not "$66.5".
+const money = (n?: number) => (n == null ? '' : `$${Number(n).toFixed(2)}`)
+
 const Row = ({ label, value, bold }: { label: string; value?: string | number; bold?: boolean }) =>
   value === undefined || value === null || value === '' ? null : (
     <div style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', fontWeight: bold ? 700 : 400 }}>
@@ -158,7 +161,7 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
               <Row label="Address" value={d.property} />
               <Row label="Work" value={d.work} />
               <Row label="Valuation" value={d.valuation != null ? `$${d.valuation}` : undefined} />
-              <Row label="Fee" value={d.fee != null ? `$${d.fee}` : undefined} bold />
+              <Row label="Fee" value={d.fee != null ? money(d.fee) : undefined} bold />
             </>)}
         <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('CONFIRM')}>
           {widget.confirmLabel || 'Confirm'}
@@ -173,9 +176,9 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
       <div style={card}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Permit filed ✅</div>
         <div style={{ marginBottom: 10 }}>Permit number: <b>{widget.permitNumber}</b></div>
-        <Row label="Amount due" value={amt != null ? `$${amt}` : 'Fee'} bold />
+        <Row label="Amount due" value={amt != null ? money(amt) : 'Fee'} bold />
         <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('PAID')}>
-          {amt != null ? `Pay $${amt}` : 'Pay now'}
+          {amt != null ? `Pay ${money(amt)}` : 'Pay now'}
         </button>
       </div>
     )

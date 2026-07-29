@@ -706,11 +706,12 @@ APPLY_OFFER_SYSTEM = (
     "or project that needs an over-the-counter permit they can file instantly, right here in this "
     "chat. Write a SHORT (about 2 sentences, ~40 words), warm, guiding reply that:\n"
     "1) briefly acknowledges their situation,\n"
-    "2) states plainly that the work itself (for example, replacing their water heater or "
-    "upgrading their electrical panel) requires a permit,\n"
-    "3) reassures them it is one they can file instantly right here, and\n"
+    "2) states plainly that this work requires a permit,\n"
+    "3) notes that a REPLACEMENT of existing equipment can be filed instantly right here, and\n"
     "4) offers to help them apply now, ending with a question.\n"
-    "Name the specific item from their message. Do not list steps or fields. Be conversational "
+    "Name the specific item from their message. Do NOT say or imply that a brand-new "
+    "installation can be filed instantly (only replacements of existing equipment qualify), and "
+    "avoid the words 'install' and 'installing'. Do not list steps or fields. Be conversational "
     "and helpful, never robotic."
 )
 
