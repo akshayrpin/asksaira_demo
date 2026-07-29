@@ -268,9 +268,13 @@ async def answer_apply_query(history, client, model):
     submitted = False
     ended = False          # eligibility gate (new installation) ended the flow this turn
     widget = None
-    for _ in range(MAX_STEPS):
+    for step in range(MAX_STEPS):
+        # Force set_fields on the first call each turn so the deterministic engine (and its
+        # widget) always runs; the model won't reliably self-call it once collecting text fields.
+        tool_choice = ({"type": "function", "function": {"name": "set_fields"}}
+                       if step == 0 else "auto")
         resp = await client.chat.completions.create(
-            model=model, messages=messages, tools=TOOLS, temperature=0)
+            model=model, messages=messages, tools=TOOLS, tool_choice=tool_choice, temperature=0)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         if not msg.tool_calls:
