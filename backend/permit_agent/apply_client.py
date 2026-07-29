@@ -12,11 +12,17 @@ payment stays a hosted link.
 """
 
 import hashlib
+import logging
 import os
 import re
 import time
 
 import aiohttp
+
+try:  # optional: the styled permit PDF. Delete permit_pdf.py and this falls back to the stub.
+    from backend.permit_agent import permit_pdf
+except Exception:
+    permit_pdf = None
 
 BASE = os.environ.get(
     "PERMIT_APPLY_BASE",
@@ -266,9 +272,15 @@ async def add_permit(app):
         return await _request(s, "POST", "addPermit", json_body=body)
 
 
-async def permit_report(act_nbr):
-    """Fetch the permit PDF (bytes) from getPermitReport, for the download button."""
+async def permit_report(act_nbr, meta=None):
+    """Fetch the permit PDF (bytes) from getPermitReport, for the download button. In mock mode
+    build the styled Burbank permit from `meta` if permit_pdf is present, else the simple stub."""
     if use_mock():
+        if permit_pdf is not None:
+            try:
+                return permit_pdf.build_permit_pdf(act_nbr, meta or {})
+            except Exception:
+                logging.exception("styled permit pdf failed; using simple stub")
         return _mock_pdf(act_nbr)
     async with aiohttp.ClientSession() as s:
         token = await _get_token(s)

@@ -293,7 +293,13 @@ async def answer_apply_query(history, client, model):
                 # Emit the PAY step and STAY in the flow (do not set submitted). Payment is a
                 # mock handled next turn in app.py, which then shows the result card.
                 widget = {"type": "pay", "permitNumber": result.get("permitNumber"),
-                          "amount": result.get("fee"), "email": args.get("email")}
+                          "amount": result.get("fee"), "email": args.get("email"),
+                          # carried through pay -> result so the download can fill the permit PDF
+                          "meta": {"address": args.get("property_address"),
+                                   "valuation": args.get("valuation"),
+                                   "description": args.get("work_type"),
+                                   "owner": args.get("name"),
+                                   "phone": args.get("phone")}}
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
         if left:  # stop the loop immediately; the turn falls through to normal routing
             return {"reply": "", "in_flow": False, "left": True, "widget": None}

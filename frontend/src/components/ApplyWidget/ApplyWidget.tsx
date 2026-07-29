@@ -29,6 +29,7 @@ export interface ApplyWidgetData {
   refLabel?: string                         // result: label for that number
   message?: string                          // result: a line of body text
   download?: boolean                        // result: false hides the permit-PDF link
+  pdfUrl?: string                           // result: full download URL (carries permit fields)
 }
 
 interface Props {
@@ -189,7 +190,7 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
         <div>{widget.refLabel || 'Permit number'}: <b>{ref}</b></div>
         {widget.message && <div style={{ marginTop: 8, color: '#444' }}>{widget.message}</div>}
         {showPdf && (
-          <a href={`/apply/permit-pdf?permit=${encodeURIComponent(widget.permitNumber || '')}`} download
+          <a href={widget.pdfUrl || `/apply/permit-pdf?permit=${encodeURIComponent(widget.permitNumber || '')}`} download
             style={{ ...primaryBtn, display: 'inline-block', textDecoration: 'none', marginTop: 12 }}>
             Download permit PDF
           </a>

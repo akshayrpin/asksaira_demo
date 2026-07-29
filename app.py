@@ -1,9 +1,11 @@
+import base64
 import copy
 import json
 import os
 import logging
 import re
 import uuid
+from urllib.parse import quote
 import httpx
 import asyncio
 from quart import (
@@ -771,9 +773,12 @@ async def try_apply_answer(request_body):
             pn, email = w.get("permitNumber"), w.get("email")
             note = f" A receipt and your permit PDF have been emailed to {email}." if email else ""
             logging.info("[APPLY AGENT] payment received for %s", pn)
+            # encode the permit fields so the download endpoint can fill the styled PDF
+            m = base64.urlsafe_b64encode(json.dumps(w.get("meta") or {}).encode()).decode()
+            pdf_url = f"/apply/permit-pdf?permit={quote(pn or '')}&m={m}"
             return {"reply": f"Payment received.{note} You can download your permit below.",
                     "in_flow": False, "flow": APPLY_FLOW,
-                    "widget": {"type": "result", "permitNumber": pn}}
+                    "widget": {"type": "result", "permitNumber": pn, "pdfUrl": pdf_url}}
 
         # 3) the user is answering the "want help applying?" offer
         if _apply_offer_pending(raw):
@@ -1118,8 +1123,15 @@ async def apply_permit_pdf():
     from quart import Response
     from backend.permit_agent import apply_client
     permit = request.args.get("permit", "")
+    meta = None
+    m = request.args.get("m")
+    if m:
+        try:
+            meta = json.loads(base64.urlsafe_b64decode(m.encode()).decode())
+        except Exception:
+            meta = None
     try:
-        pdf = await apply_client.permit_report(permit)
+        pdf = await apply_client.permit_report(permit, meta)
     except Exception:
         logging.exception("permit pdf fetch failed")
         return jsonify({"error": "report unavailable"}), 502
