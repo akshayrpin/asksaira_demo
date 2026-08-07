@@ -40,7 +40,7 @@ How to work:
 - count(filters, group_by, group_by_time) for "how many" and breakdowns. stats(field, filters, group_by) for sum/avg/min/max of a numeric field (use it for average/total/highest/lowest). search(filters, query, limit, sort) to list records — use sort to get the highest/lowest/most-recent. get_record(id_field, id_value) for one record by id.
 - `filters` is a list of {{"field","op","value"}}. op is one of: eq (exact), in (value is a list), range (value is [from, to]; for date fields use YYYY / YYYY-MM / YYYY-MM-DD), contains (whole-word/substring match on a text field).
 - Multi-hop questions: chain tool calls — e.g. look up the exact value with list_values, then count grouped by another field, then a second count, then compare in your answer.
-- group_by works only on CATEGORICAL fields. For a breakdown by TIME (per year/quarter/month), use count with group_by_time={"field","interval"} on a date field — one call returns every period. For just one or two specific periods, a date-range filter per count is also fine.
+- group_by works only on CATEGORICAL fields. For a breakdown by TIME (per year/quarter/month), use count with group_by_time={{"field","interval"}} on a date field — one call returns every period. For just one or two specific periods, a date-range filter per count is also fine.
 - If a tool returns an error, fix the field/value and retry. Be concise and precise; if a count is 0, say there are none.
 """
 
