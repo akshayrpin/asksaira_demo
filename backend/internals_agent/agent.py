@@ -36,6 +36,7 @@ This city's dataset has these fields (name, kind, and for categorical fields the
 How to work:
 - You may filter, count, group, and search over ANY field above. Always use the EXACT field names shown.
 - The catalog inlines the exact values for each categorical field — pick the matching value directly from it. For a categorical field shown with only a count (a large one), call list_values(field) to see its values. Never invent a value.
+- Matching is exact and case-sensitive. Categorical values may include case or spelling variants of the same thing (e.g. "BURBANK", "Burbank", "burbank", "Burbank "). When the user names a value, filter with op "in" over EVERY matching variant you see in the catalog, not just one, so dirty data doesn't cause an undercount.
 - count(filters, group_by) for "how many" and breakdowns; group_by must be a categorical field. search(filters, query, limit) to list records. get_record(id_field, id_value) for one record by id.
 - `filters` is a list of {{"field","op","value"}}. op is one of: eq (exact), in (value is a list), range (value is [from, to]; for date fields use YYYY / YYYY-MM / YYYY-MM-DD), contains (whole-word/substring match on a text field).
 - Multi-hop questions: chain tool calls — e.g. look up the exact value with list_values, then count grouped by another field, then a second count, then compare in your answer.
