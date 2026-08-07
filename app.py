@@ -592,7 +592,9 @@ async def try_internals_answer(request_body):
             query, client, app_settings.azure_openai.model)
     except Exception:
         logging.exception("internals agent failed")
-        return None
+        # The prefix already committed this to internals; surface the error rather than silently
+        # falling through to the permit agent / RAG, which would give a misleading answer.
+        return "Sorry, the internals data service hit an error handling that request. Please try again."
 
 
 # Live meeting-schedule lookup (Burbank-specific: only active when its Granicus feed URL is set).
