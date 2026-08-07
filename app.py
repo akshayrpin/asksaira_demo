@@ -55,6 +55,11 @@ try:  # mock conversational flows (public-record request + inspection scheduling
     from backend.permit_agent import prr_agent, inspection_agent
 except Exception:
     prr_agent = inspection_agent = None
+try:  # generic staff analytics agent over the ePALS Solr API (prefix-triggered for now)
+    from backend.internals_agent import agent as internals_agent
+except Exception:
+    internals_agent = None
+    logging.exception("internals agent unavailable")
     logging.exception("mock flow agents unavailable; PRR + inspection disabled")
 try:
     from backend import meetings as meetings_feed
@@ -563,6 +568,33 @@ async def try_permit_answer(request_body):
         return None
 
 
+# Generic staff analytics agent over the ePALS Solr API. TEST trigger: a message starting with
+# "Internals - " routes here and the prefix is stripped (later this becomes a dedicated API for the
+# ePALS team). The prefix is the only gate, so it never intercepts normal resident traffic.
+INTERNALS_PREFIX = "Internals - "
+INTERNALS_AGENT_ENABLED = bool(internals_agent) and os.environ.get("INTERNALS_AGENT_ENABLED", "1") != "0"
+
+
+async def try_internals_answer(request_body):
+    if not INTERNALS_AGENT_ENABLED:
+        return None
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    user_query = _latest_user_query(messages)
+    if not user_query or not user_query.strip().startswith(INTERNALS_PREFIX):
+        return None
+    query = user_query.strip()[len(INTERNALS_PREFIX):].strip()
+    if not query:
+        return None
+    try:
+        client = await init_openai_client()
+        logging.info("[INTERNALS AGENT] handling: %s", query)
+        return await internals_agent.answer_internals_query(
+            query, client, app_settings.azure_openai.model)
+    except Exception:
+        logging.exception("internals agent failed")
+        return None
+
+
 # Live meeting-schedule lookup (Burbank-specific: only active when its Granicus feed URL is set).
 MEETINGS_ENABLED = bool(meetings_feed) and bool(os.environ.get("MEETINGS_FEED_URL"))
 
@@ -986,6 +1018,10 @@ async def complete_chat_request(request_body, request_headers):
         )
     else:
         history_metadata = request_body.get("history_metadata", {})
+        # Staff internals agent, prefix-triggered ("Internals - ..."), checked before everything.
+        internals_answer = await try_internals_answer(request_body)
+        if internals_answer is not None:
+            return permit_non_streaming_response(internals_answer, history_metadata)
         # Keyword-triggered mock flows first: their detection is specific, and 'apply for a
         # prr' would otherwise pattern-match the instant-permit classifier and get hijacked.
         prr_answer = await try_prr_answer(request_body)
@@ -1015,6 +1051,10 @@ async def complete_chat_request(request_body, request_headers):
 
 async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
+    # Staff internals agent, prefix-triggered ("Internals - ..."), checked before everything.
+    internals_answer = await try_internals_answer(request_body)
+    if internals_answer is not None:
+        return permit_stream_response(internals_answer, history_metadata)
     # Keyword-triggered mock flows first (see complete_chat_request note).
     prr_answer = await try_prr_answer(request_body)
     if prr_answer is not None:
