@@ -57,8 +57,15 @@ def _base_kind(solr_type):
 
 async def _list_fields(base):
     root = _client.collection_root(base)
-    data = await _client.get_json(root + "/schema/fields", params={"wt": "json"})
-    return data.get("fields", []) or []
+    last = None
+    for attempt in range(3):
+        try:
+            data = await _client.get_json(root + "/schema/fields", params={"wt": "json"})
+            return data.get("fields", []) or []
+        except Exception as e:            # transient Solr blip -> retry before failing the bootstrap
+            last = e
+            await asyncio.sleep(0.4 * (attempt + 1))
+    raise last
 
 
 async def _discover_field(base, name, solr_type):
