@@ -571,7 +571,8 @@ async def try_permit_answer(request_body):
 # Generic staff analytics agent over the ePALS Solr API. TEST trigger: a message starting with
 # "Internals - " routes here and the prefix is stripped (later this becomes a dedicated API for the
 # ePALS team). The prefix is the only gate, so it never intercepts normal resident traffic.
-INTERNALS_PREFIX = "Internals - "
+# TEST trigger: a message like "Internals - ...", tolerant of singular/plural, case, and dash/colon.
+_INTERNALS_RE = re.compile(r"^\s*internals?\s*[-:]\s*", re.IGNORECASE)
 INTERNALS_AGENT_ENABLED = bool(internals_agent) and os.environ.get("INTERNALS_AGENT_ENABLED", "1") != "0"
 
 
@@ -580,9 +581,12 @@ async def try_internals_answer(request_body):
         return None
     messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
     user_query = _latest_user_query(messages)
-    if not user_query or not user_query.strip().startswith(INTERNALS_PREFIX):
+    if not user_query:
         return None
-    query = user_query.strip()[len(INTERNALS_PREFIX):].strip()
+    hit = _INTERNALS_RE.match(user_query)
+    if not hit:
+        return None
+    query = user_query[hit.end():].strip()
     if not query:
         return None
     try:

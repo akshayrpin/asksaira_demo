@@ -41,6 +41,7 @@ How to work:
 - `filters` is a list of {{"field","op","value"}}. op is one of: eq (exact), in (value is a list), range (value is [from, to]; for date fields use YYYY / YYYY-MM / YYYY-MM-DD), contains (whole-word/substring match on a text field).
 - Multi-hop questions: chain tool calls — e.g. look up the exact value with list_values, then count grouped by another field, then a second count, then compare in your answer.
 - group_by works only on CATEGORICAL fields. For a breakdown by TIME (per year/quarter/month), use count with group_by_time={{"field","interval"}} on a date field — one call returns every period. For just one or two specific periods, a date-range filter per count is also fine.
+- Be explicit about what you counted. When a question is ambiguous — which date field (applied/issued/finaled), what "permits" scopes to (all records, or one module like BUILDING), or which value / spelling variant — pick the most reasonable interpretation, then state plainly what you actually queried (the field(s), value(s), date field, and any default you assumed) and invite the user to refine. Never give a number without making clear what it represents.
 - If a tool returns an error, fix the field/value and retry. Be concise and precise; if a count is 0, say there are none.
 """
 
