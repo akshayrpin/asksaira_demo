@@ -37,9 +37,10 @@ How to work:
 - You may filter, count, group, and search over ANY field above. Always use the EXACT field names shown.
 - The catalog inlines the exact values for each categorical field — pick the matching value directly from it. For a categorical field shown with only a count (a large one), call list_values(field) to see its values. Never invent a value.
 - Matching is exact and case-sensitive. Categorical values may include case or spelling variants of the same thing (e.g. "BURBANK", "Burbank", "burbank", "Burbank "). When the user names a value, filter with op "in" over EVERY matching variant you see in the catalog, not just one, so dirty data doesn't cause an undercount.
-- count(filters, group_by) for "how many" and breakdowns; group_by must be a categorical field. search(filters, query, limit) to list records. get_record(id_field, id_value) for one record by id.
+- count(filters, group_by, group_by_time) for "how many" and breakdowns. stats(field, filters, group_by) for sum/avg/min/max of a numeric field (use it for average/total/highest/lowest). search(filters, query, limit, sort) to list records — use sort to get the highest/lowest/most-recent. get_record(id_field, id_value) for one record by id.
 - `filters` is a list of {{"field","op","value"}}. op is one of: eq (exact), in (value is a list), range (value is [from, to]; for date fields use YYYY / YYYY-MM / YYYY-MM-DD), contains (whole-word/substring match on a text field).
 - Multi-hop questions: chain tool calls — e.g. look up the exact value with list_values, then count grouped by another field, then a second count, then compare in your answer.
+- group_by works only on CATEGORICAL fields. For a breakdown by TIME (per year/quarter/month), use count with group_by_time={"field","interval"} on a date field — one call returns every period. For just one or two specific periods, a date-range filter per count is also fine.
 - If a tool returns an error, fix the field/value and retry. Be concise and precise; if a count is 0, say there are none.
 """
 
@@ -63,7 +64,28 @@ TOOLS = [
                     "value": {"description": "a string for eq/contains, [from,to] for range, or a list for in"},
                 }, "required": ["field", "value"]}},
             "group_by": {"type": "string", "description": "a categorical field to break the count down by"},
+            "group_by_time": {"type": "object", "description": "break the count into time periods on a DATE field (one call returns every period)",
+                "properties": {
+                    "field": {"type": "string"},
+                    "interval": {"type": "string", "enum": ["year", "quarter", "month", "day"]},
+                    "start": {"type": "string", "description": "optional start year YYYY"},
+                    "end": {"type": "string", "description": "optional end year YYYY"},
+                }, "required": ["field", "interval"]},
         }},
+    }},
+    {"type": "function", "function": {
+        "name": "stats",
+        "description": "Aggregate a NUMERIC field: sum, average (avg), min, max — optionally broken down by a categorical field. Use for 'average/total/highest/lowest' questions.",
+        "parameters": {"type": "object", "properties": {
+            "field": {"type": "string", "description": "a numeric field"},
+            "filters": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "field": {"type": "string"},
+                    "op": {"type": "string", "enum": ["eq", "in", "range", "contains"]},
+                    "value": {"description": "a string for eq/contains, [from,to] for range, or a list for in"},
+                }, "required": ["field", "value"]}},
+            "group_by": {"type": "string", "description": "optional categorical field to break the stats down by"},
+        }, "required": ["field"]},
     }},
     {"type": "function", "function": {
         "name": "search",
@@ -77,6 +99,9 @@ TOOLS = [
                 }, "required": ["field", "value"]}},
             "query": {"type": "string", "description": "free-text keywords (e.g. an applicant/owner name)"},
             "limit": {"type": "integer"},
+            "sort": {"type": "object", "description": "order results, e.g. highest valuation or most recent first",
+                "properties": {"field": {"type": "string"}, "dir": {"type": "string", "enum": ["asc", "desc"]}},
+                "required": ["field"]},
         }},
     }},
     {"type": "function", "function": {
@@ -94,9 +119,12 @@ async def _dispatch(name, args, base):
     if name == "list_values":
         return await ic.list_values(base, args.get("field"), args.get("contains"))
     if name == "count":
-        return await ic.count(base, args.get("filters"), args.get("group_by"))
+        return await ic.count(base, args.get("filters"), args.get("group_by"), args.get("group_by_time"))
+    if name == "stats":
+        return await ic.stats(base, args.get("field"), args.get("filters"), args.get("group_by"))
     if name == "search":
-        return await ic.search(base, args.get("filters"), args.get("query"), args.get("limit", 12))
+        return await ic.search(base, args.get("filters"), args.get("query"),
+                                args.get("limit", 12), args.get("sort"))
     if name == "get_record":
         return await ic.get_record(base, args.get("id_field"), args.get("id_value"))
     return {"error": f"unknown tool {name}"}
