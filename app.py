@@ -1137,6 +1137,37 @@ async def conversation():
     return await conversation_internal(request_json, request.headers)
 
 
+# Generic ePALS analytics agent exposed as an API for the ePALS team to integrate. Distinct from
+# the in-app "Internals - " chat trigger. Auth: a shared key in the X-API-Key header.
+INTERNALS_API_KEY = os.environ.get("INTERNALS_API_KEY", "")
+
+
+@bp.route("/api/internals", methods=["POST"])
+async def internals_api():
+    """Body: {"query": "...", "epals_api": "<Solr query base URL for the city>"} (epals_api
+    optional; defaults to the configured base). Returns {"answer": "..."}."""
+    if not INTERNALS_API_KEY or request.headers.get("X-API-Key") != INTERNALS_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    if not internals_agent:
+        return jsonify({"error": "internals agent unavailable"}), 503
+    if not request.is_json:
+        return jsonify({"error": "request must be json"}), 415
+    body = await request.get_json() or {}
+    query = body.get("query")
+    epals_api = body.get("epals_api")   # per-city Solr base URL; None -> default (Burbank)
+    # TODO: validate epals_api against an allowlist of known ePALS hosts (SSRF guard).
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+    try:
+        client = await init_openai_client()
+        answer = await internals_agent.answer_internals_query(
+            query, client, app_settings.azure_openai.model, base=epals_api)
+        return jsonify({"answer": answer}), 200
+    except Exception:
+        logging.exception("internals api failed")
+        return jsonify({"error": "internal error"}), 500
+
+
 @bp.route("/frontend_settings", methods=["GET"])
 def get_frontend_settings():
     try:
