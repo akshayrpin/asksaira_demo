@@ -1,13 +1,15 @@
 """
-Public Record Request (PRR) agent — fully MOCK, single-window intake.
+Public Record Request (PRR) agent — single-window intake that files to the City's PRR API.
 
 Shape mirrors the instant-permit apply agent (a tool-calling loop, a code-decided widget, a
-CONFIRM gate in code), but nothing is filed: submit returns a mock CPRA reference number.
+CONFIRM gate in code). On CONFIRM the request is filed via the edgesoft PRR intake endpoint
+(_submit_to_edgesoft); the resident is shown a local acknowledgement reference number. The
+external call is best-effort: on failure the resident still gets a graceful confirmation and
+the error is logged loudly for staff to reconcile.
 
 Flow: app.py detects the PRR keyword and makes an OFFER (Yes/No chips). On "yes" this agent
 runs and shows ONE form window collecting everything at once (records, name, email); the user
-submits it, reviews, and replies CONFIRM. No back-and-forth questioning, no RAG, no external
-API (so no :9080 dependency).
+submits it, reviews, and replies CONFIRM. No back-and-forth questioning, no RAG.
 
 Entry point:
   answer_prr_query(history, client, model) -> {"reply", "in_flow", "widget", "left"}
@@ -18,7 +20,14 @@ import json
 import logging
 import re
 
+import aiohttp
+
 MAX_STEPS = 5
+
+# City PRR intake API (edgesoft). method/createdBy/captcha are fixed per the vendor; the rest
+# come from the collected form. Returns the plain text "true" on success.
+PRR_ENDPOINT = "http://clients.edgesoftinc.com/sairaprr/actionsearch.jsp"
+PRR_TIMEOUT = 20
 
 SYSTEM = """You are the City's public-records assistant, running inside a chat. You help a resident file a California Public Records Act (CPRA) request. Nothing is actually filed here; this is a guided intake that produces a reference number.
 
@@ -110,13 +119,43 @@ def _mock_reference(a):
     return f"PRR-2026-{n:04d}"
 
 
-def handle_submit(a, user_confirmed):
+async def _submit_to_edgesoft(a):
+    """File the request with the City's PRR intake API. Best-effort: on ANY failure we log
+    loudly and return False, but the resident still gets a graceful confirmation (staff reconcile
+    from the logs). Returns True only when the API confirms with the plain text 'true'.
+    The form collects one full `name`; the API's `fname` gets the whole thing (no last-name param)."""
+    params = {
+        "method": "emailrequest",
+        "createdBy": "-1",
+        "captcha": "1",
+        "fname": a.get("name", ""),
+        "email": a.get("email", ""),
+        "description": a.get("records_description", ""),
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(PRR_ENDPOINT, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=PRR_TIMEOUT)) as r:
+                body = (await r.text()).strip()
+                if r.status == 200 and body.lower() == "true":
+                    logging.info("PRR filed via edgesoft for %s", params["email"])
+                    return True
+                logging.error("PRR edgesoft submit did NOT confirm (status=%s body=%r) for %s",
+                              r.status, body[:200], params["email"])
+                return False
+    except Exception:
+        logging.exception("PRR edgesoft submit FAILED for %s", params.get("email"))
+        return False
+
+
+async def handle_submit(a, user_confirmed):
     """CONFIRM gate in code: only 'submit' when the user explicitly confirmed."""
     if not user_confirmed:
         return {"status": "not_confirmed",
                 "message": "The user has not typed CONFIRM yet. Show the review and wait. Do not submit."}
     if not str(a.get("records_description", "")).strip() or not _valid_email(a.get("email")):
         return {"status": "invalid", "message": "Details are incomplete. Ask them to re-check the request."}
+    await _submit_to_edgesoft(a)   # files the request; never raises (graceful msg + loud log on failure)
     ref = _mock_reference(a)
     return {"status": "submitted", "reference": ref,
             "_widget": {"type": "result", "title": "Request submitted ✅",
@@ -133,11 +172,11 @@ def _user_confirmed(history):
     return False
 
 
-def _dispatch(name, args, history):
+async def _dispatch(name, args, history):
     if name == "set_fields":
         return handle_set_fields(args)
     if name == "submit_request":
-        return handle_submit(args, _user_confirmed(history))
+        return await handle_submit(args, _user_confirmed(history))
     if name == "leave_flow":
         return {"status": "left"}
     return {"error": f"unknown tool {name}"}
@@ -160,7 +199,7 @@ async def answer_prr_query(history, client, model):
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
-                result = _dispatch(tc.function.name, args, history)
+                result = await _dispatch(tc.function.name, args, history)
             except Exception as e:
                 logging.exception("prr tool failed: %s", tc.function.name)
                 result = {"error": str(e)}
