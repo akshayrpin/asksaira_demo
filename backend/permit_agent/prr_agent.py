@@ -202,9 +202,15 @@ async def answer_prr_query(history, client, model):
     left = False
     submitted = False
     widget = None
-    for _ in range(MAX_STEPS):
+    # On an Edit tap the latest user message is a bare "EDIT". Force set_fields on the first step so
+    # the prefilled form re-opens deterministically; otherwise the model sometimes just chats (no
+    # widget) or calls leave_flow, escaping the flow to website RAG.
+    force_set_fields = _edit_requested(history)
+    for step in range(MAX_STEPS):
+        kwargs = ({"tool_choice": {"type": "function", "function": {"name": "set_fields"}}}
+                  if step == 0 and force_set_fields else {})
         resp = await client.chat.completions.create(
-            model=model, messages=messages, tools=TOOLS, temperature=0)
+            model=model, messages=messages, tools=TOOLS, temperature=0, **kwargs)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         if not msg.tool_calls:
