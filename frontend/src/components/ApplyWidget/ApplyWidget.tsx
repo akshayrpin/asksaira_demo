@@ -25,6 +25,8 @@ export interface ApplyWidgetData {
   title?: string                            // card heading
   rows?: { label: string; value?: string | number }[]  // review: generic rows instead of `data`
   confirmLabel?: string                     // review: button label (still posts 'CONFIRM')
+  edit?: boolean                            // review: show an Edit button (posts 'EDIT' -> re-opens the form)
+  editLabel?: string                        // review: Edit button label
   reference?: string                        // result: reference/confirmation number
   refLabel?: string                         // result: label for that number
   message?: string                          // result: a line of body text
@@ -53,6 +55,10 @@ const input: React.CSSProperties = {
 const primaryBtn: React.CSSProperties = {
   marginTop: 14, padding: '12px 20px', borderRadius: 8, border: 'none',
   background: '#0f6cbd', color: '#fff', cursor: 'pointer', fontSize: 15, fontWeight: 600
+}
+const secondaryBtn: React.CSSProperties = {
+  padding: '12px 20px', borderRadius: 8, border: '1px solid #0f6cbd',
+  background: '#fff', color: '#0f6cbd', cursor: 'pointer', fontSize: 15, fontWeight: 600
 }
 
 // Money always shows two decimals, so a fee reads "$66.50", not "$66.5".
@@ -163,9 +169,16 @@ export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
               <Row label="Valuation" value={d.valuation != null ? `$${d.valuation}` : undefined} />
               <Row label="Fee" value={d.fee != null ? money(d.fee) : undefined} bold />
             </>)}
-        <button style={primaryBtn} disabled={disabled} onClick={() => onSubmit('CONFIRM')}>
-          {widget.confirmLabel || 'Confirm'}
-        </button>
+        <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
+          <button style={{ ...primaryBtn, marginTop: 0 }} disabled={disabled} onClick={() => onSubmit('CONFIRM')}>
+            {widget.confirmLabel || 'Confirm'}
+          </button>
+          {widget.edit && (
+            <button style={secondaryBtn} disabled={disabled} onClick={() => onSubmit('EDIT')}>
+              {widget.editLabel || 'Edit'}
+            </button>
+          )}
+        </div>
       </div>
     )
   }

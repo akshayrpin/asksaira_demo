@@ -92,25 +92,29 @@ def _valid_email(e):
     return bool(e) and bool(re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(e)))
 
 
-def handle_set_fields(a):
+def handle_set_fields(a, force_form=False):
     """Deterministic engine: show the form until everything's in, then the review. The
     '_widget' key is popped before the model sees the result, so the model never picks the
-    widget, only what to say."""
+    widget, only what to say. force_form re-shows the (prefilled) form when the user tapped Edit
+    on the review, so they can change an answer before confirming."""
     missing = [f for f in _PRR_FIELDS if not str(a.get(f["name"]) or "").strip()]
-    if missing or not _valid_email(a.get("email")):
+    if force_form or missing or not _valid_email(a.get("email")):
         msg = "Point them to the form below to enter their request."
-        if not missing and not _valid_email(a.get("email")):
+        if force_form:
+            msg = "They want to edit. Point them to the form below to update their request."
+        elif not missing and not _valid_email(a.get("email")):
             msg = "That email doesn't look valid. Ask them to re-check the form below."
         return {"need": "details", "_widget": _prr_form(a), "message": msg}
     return {"status": "review",
             "_widget": {"type": "review", "confirm": True, "confirmLabel": "Submit request",
+                        "edit": True, "editLabel": "Edit",
                         "title": "Review your records request",
                         "rows": [
                             {"label": "Records", "value": a["records_description"]},
                             {"label": "Requester", "value": a["name"]},
                             {"label": "Email", "value": a["email"]},
                         ]},
-            "message": "Show the review and ask them to reply CONFIRM to submit the request."}
+            "message": "Show the review and ask them to reply CONFIRM to submit, or tap Edit to change it."}
 
 
 def _mock_reference(a):
@@ -120,9 +124,10 @@ def _mock_reference(a):
 
 
 async def _submit_to_edgesoft(a):
-    """File the request with the City's PRR intake API. Best-effort: on ANY failure we log
-    loudly and return False, but the resident still gets a graceful confirmation (staff reconcile
-    from the logs). Returns True only when the API confirms with the plain text 'true'.
+    """File the request with the City's PRR intake API and return the City's request number
+    (the endpoint responds with a bare number, e.g. '0143'). Best-effort: on ANY failure we log
+    loudly and return None, and the resident still gets a graceful confirmation with a local
+    reference (staff reconcile from the logs).
     The form collects one full `name`; the API's `fname` gets the whole thing (no last-name param)."""
     params = {
         "method": "emailrequest",
@@ -137,15 +142,15 @@ async def _submit_to_edgesoft(a):
             async with session.get(PRR_ENDPOINT, params=params,
                                    timeout=aiohttp.ClientTimeout(total=PRR_TIMEOUT)) as r:
                 body = (await r.text()).strip()
-                if r.status == 200 and body.lower() == "true":
-                    logging.info("PRR filed via edgesoft for %s", params["email"])
-                    return True
-                logging.error("PRR edgesoft submit did NOT confirm (status=%s body=%r) for %s",
+                if r.status == 200 and re.fullmatch(r"\d+", body):
+                    logging.info("PRR filed via edgesoft: number=%s for %s", body, params["email"])
+                    return body
+                logging.error("PRR edgesoft submit did NOT return a number (status=%s body=%r) for %s",
                               r.status, body[:200], params["email"])
-                return False
+                return None
     except Exception:
         logging.exception("PRR edgesoft submit FAILED for %s", params.get("email"))
-        return False
+        return None
 
 
 async def handle_submit(a, user_confirmed):
@@ -155,8 +160,9 @@ async def handle_submit(a, user_confirmed):
                 "message": "The user has not typed CONFIRM yet. Show the review and wait. Do not submit."}
     if not str(a.get("records_description", "")).strip() or not _valid_email(a.get("email")):
         return {"status": "invalid", "message": "Details are incomplete. Ask them to re-check the request."}
-    await _submit_to_edgesoft(a)   # files the request; never raises (graceful msg + loud log on failure)
-    ref = _mock_reference(a)
+    # File it and use the City's returned PRR number; fall back to a local ref only if the API
+    # failed (graceful message to the resident + loud log for staff).
+    ref = await _submit_to_edgesoft(a) or _mock_reference(a)
     return {"status": "submitted", "reference": ref,
             "_widget": {"type": "result", "title": "Request submitted ✅",
                         "refLabel": "Reference number", "reference": ref, "download": False,
@@ -172,9 +178,17 @@ def _user_confirmed(history):
     return False
 
 
+def _edit_requested(history):
+    """True if the latest user message is the review's Edit tap (posts the literal 'EDIT')."""
+    for m in reversed(history):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"].strip().upper() == "EDIT"
+    return False
+
+
 async def _dispatch(name, args, history):
     if name == "set_fields":
-        return handle_set_fields(args)
+        return handle_set_fields(args, force_form=_edit_requested(history))
     if name == "submit_request":
         return await handle_submit(args, _user_confirmed(history))
     if name == "leave_flow":
