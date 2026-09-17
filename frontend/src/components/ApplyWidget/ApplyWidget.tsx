@@ -3,9 +3,11 @@ import { useRef, useState } from 'react'
 // The fixed-five widget payloads emitted by the instant-permit apply agent
 // (backend: apply_agent._widget_for). Rendered inline under the assistant's message.
 export interface ApplyWidgetData {
-  type: 'chips' | 'address_autocomplete' | 'form' | 'review' | 'result' | 'pay'
+  type: 'chips' | 'address_autocomplete' | 'form' | 'review' | 'result' | 'pay' | 'calendar'
   field?: string
   options?: string[]
+  available_dates?: string[]                       // calendar: ISO dates that are selectable
+  times?: { label: string; value: string }[]       // calendar: morning/afternoon slots
   fields?: { name: string; label: string; inputType?: string }[]
   values?: Record<string, string | number>
   confirm?: boolean
@@ -134,8 +136,71 @@ function FormWidget({ fields, values, onSubmit, disabled }: {
   )
 }
 
+// Local-date ISO (no timezone shift, unlike toISOString which is UTC).
+const isoLocal = (x: Date) =>
+  `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+
+function CalendarWidget({ available, times, onSubmit, disabled }: {
+  available: string[]; times: { label: string; value: string }[]
+  onSubmit: (t: string) => void; disabled?: boolean
+}) {
+  const [date, setDate] = useState('')
+  const [slot, setSlot] = useState('')
+  const avail = new Set(available)
+  const dates = available.map(s => new Date(s + 'T00:00:00'))
+  if (dates.length === 0) return null
+  const first = dates[0], last = dates[dates.length - 1]
+  // Grid from the Sunday of the first available week through the last available date, padded to full weeks.
+  const start = new Date(first); start.setDate(first.getDate() - first.getDay())
+  const cells: Date[] = []
+  for (const d = new Date(start); d <= last || cells.length % 7 !== 0; d.setDate(d.getDate() + 1)) {
+    cells.push(new Date(d)); if (cells.length > 42) break
+  }
+  const header = first.getMonth() === last.getMonth()
+    ? first.toLocaleString('default', { month: 'long', year: 'numeric' })
+    : `${first.toLocaleString('default', { month: 'long' })} – ${last.toLocaleString('default', { month: 'long', year: 'numeric' })}`
+  const dow = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
+  const ready = date && slot
+  return (
+    <div style={card}>
+      <div style={{ fontWeight: 600, marginBottom: 10 }}>{header}</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 4 }}>
+        {dow.map(h => <div key={h} style={{ textAlign: 'center', fontSize: 12, color: '#999' }}>{h}</div>)}
+        {cells.map(c => {
+          const s = isoLocal(c), ok = avail.has(s), sel = s === date
+          return (
+            <button key={s} disabled={disabled || !ok} onClick={() => setDate(s)}
+              style={{
+                padding: '9px 0', borderRadius: 8,
+                border: sel ? '2px solid #0f6cbd' : '1px solid #e6e6e6',
+                background: sel ? '#0f6cbd' : ok ? '#fff' : '#f4f4f4',
+                color: sel ? '#fff' : ok ? '#0f6cbd' : '#c4c4c4',
+                cursor: ok ? 'pointer' : 'default', fontSize: 14, fontWeight: ok ? 600 : 400,
+              }}>{c.getDate()}</button>
+          )
+        })}
+      </div>
+      <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+        {times.map(t => (
+          <button key={t.value} disabled={disabled} onClick={() => setSlot(t.value)}
+            style={{ ...chip, ...(slot === t.value ? { background: '#0f6cbd', color: '#fff' } : {}) }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <button style={{ ...primaryBtn, opacity: ready ? 1 : 0.5 }} disabled={disabled || !ready}
+        onClick={() => onSubmit(`date: ${date}, time_slot: ${slot}`)}>Confirm</button>
+    </div>
+  )
+}
+
 export const ApplyWidget = ({ widget, onSubmit, disabled }: Props) => {
   if (!widget) return null
+
+  if (widget.type === 'calendar') {
+    return <CalendarWidget available={widget.available_dates || []} times={widget.times || []}
+      onSubmit={onSubmit} disabled={disabled} />
+  }
 
   if (widget.type === 'form') {
     return <FormWidget fields={widget.fields || []} values={widget.values} onSubmit={onSubmit} disabled={disabled} />
