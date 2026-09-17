@@ -202,10 +202,12 @@ async def answer_prr_query(history, client, model):
     left = False
     submitted = False
     widget = None
-    # On an Edit tap the latest user message is a bare "EDIT". Force set_fields on the first step so
-    # the prefilled form re-opens deterministically; otherwise the model sometimes just chats (no
-    # widget) or calls leave_flow, escaping the flow to website RAG.
-    force_set_fields = _edit_requested(history)
+    # The form/review widget only exists when set_fields runs, but the model sometimes writes the
+    # "fill out the form below" line WITHOUT calling set_fields, so no widget renders. Force
+    # set_fields on the first step for every turn EXCEPT the CONFIRM turn (where the model must call
+    # submit_request instead). This guarantees the form (or review) widget is always emitted while
+    # collecting, and still lets a confirmed request submit.
+    force_set_fields = not _user_confirmed(history)
     for step in range(MAX_STEPS):
         kwargs = ({"tool_choice": {"type": "function", "function": {"name": "set_fields"}}}
                   if step == 0 and force_set_fields else {})
