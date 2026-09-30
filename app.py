@@ -220,9 +220,17 @@ MS_DEFENDER_ENABLED = os.environ.get("MS_DEFENDER_ENABLED", "true").lower() == "
 
 
 # Initialize Azure OpenAI Client
+_OPENAI_CLIENT = None   # cached singleton: reuse the httpx connection pool across calls (a fresh
+                        # client per call meant a new TLS handshake on every embed/classify/answer,
+                        # ~1s of pure connection overhead per voice turn). Key-auth only.
+
+
 async def init_openai_client():
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is not None:
+        return _OPENAI_CLIENT
     azure_openai_client = None
-    
+
     try:
         # API version check
         if (
@@ -275,6 +283,8 @@ async def init_openai_client():
             azure_endpoint=endpoint,
         )
 
+        if aoai_api_key:               # cache only for key auth; the AAD token provider is built
+            _OPENAI_CLIENT = azure_openai_client   # inside a closed credential context, don't reuse
         return azure_openai_client
     except Exception as e:
         logging.exception("Exception in Azure OpenAI initialization", e)
@@ -1370,6 +1380,30 @@ async def conversation():
     return await conversation_internal(request_json, request.headers)
 
 
+@bp.route("/voice-debug", methods=["GET", "POST"])
+async def voice_debug():
+    """Run the voice brain on one question and return the full answer + timing, WITHOUT Retell.
+    Lets us verify voice answers and measure time-to-first-token independent of the call connection.
+    Usage: GET /voice-debug?q=who+is+running+for+city+council"""
+    q = request.args.get("q")
+    if not q and request.method == "POST":
+        q = ((await request.get_json(silent=True)) or {}).get("q")
+    if not q:
+        return jsonify({"error": "pass ?q=<question>"}), 400
+    t0 = time.monotonic()
+    pieces, first_ms = [], None
+    async for piece in run_voice_turn_stream({"messages": [{"role": "user", "content": q}]}):
+        if piece and first_ms is None:
+            first_ms = int((time.monotonic() - t0) * 1000)
+        pieces.append(piece)
+    return jsonify({
+        "q": q,
+        "answer": "".join(pieces),
+        "first_token_ms": first_ms,
+        "total_ms": int((time.monotonic() - t0) * 1000),
+    })
+
+
 # ---------------------------------------------------------------------------------------------
 # Voice channel (Retell Custom LLM websocket).
 #
@@ -1385,6 +1419,11 @@ async def conversation():
 # multi-turn voice flows come in slice 2 (per-call state keyed by call_id).
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")   # [text](url) -> text
 _CITE_RE = re.compile(r"\s*\[doc\d+\]")                   # drop [doc1] citation markers
+# Greetings / closings: answer conversationally, with NO retrieval and NO "let me check" filler.
+_SMALLTALK_RE = re.compile(
+    r"^\s*(hi|hello|hey|yo|good\s+(morning|afternoon|evening)|how\s+are\s+you|"
+    r"what'?s\s+up|thanks?|thank\s+you|ok(ay)?|great|cool|bye|goodbye|see\s+you)"
+    r"[\s.,!?]*$", re.I)
 
 
 def _voice_text(text):
@@ -1485,8 +1524,24 @@ async def run_voice_turn_stream(request_body):
     route yields its full reply once. Skips reformulate (an LLM hop) for latency -- voice is mostly
     single-turn, and mid-flow transactional already bypasses classify."""
     raw = request_body.get("messages", [])
-    if not any(m.get("role") == "user" and m.get("content") for m in raw):
-        yield "Hi, this is the City of Burbank assistant. How can I help you today?"
+    last_user = (_latest_user_query(raw) or "").strip()
+    # Retell's opening turn arrives with the transcript ALREADY holding "(unintelligible audio)"
+    # (its STT placeholder), and it sends that whenever STT gets nothing. Never run the brain on it:
+    # on the first turn greet (this is also how the agent speaks first); after that, ask to repeat.
+    # Fixed strings, so they play immediately -- no retrieval, no cancel.
+    if not last_user or "unintelligible" in last_user.lower():
+        spoke_before = any(m.get("role") == "assistant" and (m.get("content") or "").strip()
+                           for m in raw)
+        yield ("Sorry, I didn't catch that. Could you say that again?" if spoke_before
+               else "Hi, this is the City of Burbank assistant. How can I help you today?")
+        return
+    # Greetings / thanks / closings: reply directly, no classify, no retrieval, no filler.
+    if _SMALLTALK_RE.match(last_user):
+        low = last_user.lower()
+        if any(w in low for w in ("thank", "bye", "goodbye", "see you")):
+            yield "You're welcome. Is there anything else I can help you with?"
+        else:
+            yield "Hi! I can help with City of Burbank services, permits, and more. What do you need?"
         return
     internals = await try_internals_answer(request_body)
     if internals is not None:
@@ -1496,7 +1551,7 @@ async def run_voice_turn_stream(request_body):
     if mid_flow:
         q, domain = None, None
     else:
-        q = _latest_user_query(raw)                  # skip reformulate (LLM hop) for voice latency
+        q = last_user                                # skip reformulate (LLM hop) for voice latency
         domain = await classify_request(request_body, q)
     prr = await try_prr_answer(request_body, domain)
     if prr is not None:
