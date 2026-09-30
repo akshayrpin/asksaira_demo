@@ -1548,11 +1548,22 @@ async def run_voice_turn_stream(request_body):
         yield _voice_text(internals)
         return
     mid_flow = _flow_family(_last_bot_flow(raw)) is not None
+    retrieval_task = None
     if mid_flow:
         q, domain = None, None
     else:
         q = last_user                                # skip reformulate (LLM hop) for voice latency
+        client = await init_openai_client()
+        # Most voice turns are website. Kick off retrieval SPECULATIVELY in parallel with the router
+        # (classify is ~2s on the big prompt), so retrieval hides under it; speak a filler at ~0ms to
+        # hold the line. If the route turns out non-website, the speculative work is cancelled.
+        retrieval_task = asyncio.create_task(website_pipeline._retrieve_context(
+            q, client, app_settings.azure_openai.model, 6, 30, 15, 8000, 32000, q)) \
+            if (CODE_PIPELINE_ENABLED and website_pipeline) else None
+        yield "Let me check that for you."
         domain = await classify_request(request_body, q)
+        if retrieval_task and domain not in ("website", "codes"):
+            retrieval_task.cancel()                  # not website -> discard the speculative retrieval
     prr = await try_prr_answer(request_body, domain)
     if prr is not None:
         yield _voice_text(prr["reply"])
@@ -1581,18 +1592,15 @@ async def run_voice_turn_stream(request_body):
     if zoning is not None:
         yield _voice_text(zoning[0])
         return
-    # Website: STREAM tokens as they generate -- the latency win. retrieval_query=q skips expansion.
-    if CODE_PIPELINE_ENABLED and website_pipeline and domain in ("website", "codes") and q:
-        # FILLER FIRST: retrieval takes ~2s, and Retell hangs up if it hears nothing for ~3s. A
-        # holding phrase sent immediately resets Retell's turn timer, buying time for retrieval +
-        # the first answer token. Trim retrieval breadth (fewer candidates/smaller pool) for speed.
-        yield "Let me check that for you."
+    # Website: await the speculative retrieval (already running since before classify) and STREAM
+    # the answer tokens. The filler was sent above; retrieval overlapped classify, so the first real
+    # token lands ~2.5s in instead of ~4s.
+    if retrieval_task and domain in ("website", "codes") and q:
         try:
-            client = await init_openai_client()
+            sources, _c, _h, _rms, _t = await retrieval_task
             emitted = False
-            async for piece in website_pipeline.stream_website_answer(
-                    q, client, app_settings.azure_openai.model,
-                    system=VOICE_SYSTEM, retrieval_query=q, k=6, candidates=30, pool=15):
+            async for piece in website_pipeline.stream_answer_from_sources(
+                    q, sources, client, app_settings.azure_openai.model, system=VOICE_SYSTEM):
                 piece = _CITE_RE.sub("", piece)      # drop any [docN] marker that slips through
                 if piece:
                     emitted = True

@@ -318,16 +318,10 @@ async def _retrieve_context(question, client, model, k, candidates, pool,
     return sources, citations, hits, retrieve_ms, t0
 
 
-async def stream_website_answer(question, client, model, system=None, retrieval_query=None,
-                                k=8, candidates=50, pool=30, page_char_cap=8000,
-                                total_char_cap=32000):
-    """Voice variant: same retrieval, but STREAM the answer tokens (yield deltas) so the caller can
-    start speaking within ~1s instead of waiting for the whole answer. Skips the URL-repair /
-    observability tail (voice strips URLs anyway); pass retrieval_query=question to skip expansion."""
-    sources, _citations, _hits, retrieve_ms, _t0 = await _retrieve_context(
-        question, client, model, k, candidates, pool, page_char_cap, total_char_cap, retrieval_query)
+async def stream_answer_from_sources(question, sources, client, model, system=None):
+    """Stream the answer tokens (deltas) given ALREADY-retrieved source blocks. Split out so the
+    voice path can run retrieval in parallel with the router and then just stream generation."""
     sys_text = (system or SYSTEM).format(today=date.today().strftime("%A, %B %d, %Y (%Y-%m-%d)"))
-    logging.info("[WEBSITE VOICE] retrieve_ms=%d streaming answer", retrieve_ms)
     stream = await client.chat.completions.create(
         model=model, temperature=0, stream=True,
         messages=[{"role": "system", "content": sys_text},
@@ -335,6 +329,18 @@ async def stream_website_answer(question, client, model, system=None, retrieval_
     async for chunk in stream:
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+
+
+async def stream_website_answer(question, client, model, system=None, retrieval_query=None,
+                                k=8, candidates=50, pool=30, page_char_cap=8000,
+                                total_char_cap=32000):
+    """Voice variant: same retrieval, but STREAM the answer tokens so the caller can start speaking
+    sooner. Pass retrieval_query=question to skip expansion."""
+    sources, _citations, _hits, retrieve_ms, _t0 = await _retrieve_context(
+        question, client, model, k, candidates, pool, page_char_cap, total_char_cap, retrieval_query)
+    logging.info("[WEBSITE VOICE] retrieve_ms=%d streaming answer", retrieve_ms)
+    async for piece in stream_answer_from_sources(question, sources, client, model, system):
+        yield piece
 
 
 async def answer_website_query(question, client, model, k=8, candidates=50, pool=30,
