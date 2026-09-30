@@ -1479,6 +1479,73 @@ async def run_voice_turn(request_body):
             "at (818) 238-5800.")
 
 
+async def run_voice_turn_stream(request_body):
+    """Streaming voice turn: yields text pieces as they're ready. The website route STREAMS answer
+    tokens (caller starts speaking in ~1s instead of waiting for the whole answer); every other
+    route yields its full reply once. Skips reformulate (an LLM hop) for latency -- voice is mostly
+    single-turn, and mid-flow transactional already bypasses classify."""
+    raw = request_body.get("messages", [])
+    if not any(m.get("role") == "user" and m.get("content") for m in raw):
+        yield "Hi, this is the City of Burbank assistant. How can I help you today?"
+        return
+    internals = await try_internals_answer(request_body)
+    if internals is not None:
+        yield _voice_text(internals)
+        return
+    mid_flow = _flow_family(_last_bot_flow(raw)) is not None
+    if mid_flow:
+        q, domain = None, None
+    else:
+        q = _latest_user_query(raw)                  # skip reformulate (LLM hop) for voice latency
+        domain = await classify_request(request_body, q)
+    prr = await try_prr_answer(request_body, domain)
+    if prr is not None:
+        yield _voice_text(prr["reply"])
+        return
+    inspection = await try_inspection_answer(request_body, domain)
+    if inspection is not None:
+        yield _voice_text(inspection["reply"])
+        return
+    apply_ans = await try_apply_answer(request_body, domain)
+    if apply_ans is not None:
+        yield _voice_text(apply_ans["reply"])
+        return
+    permit = await try_permit_answer(request_body, domain, q)
+    if permit is not None:
+        yield _voice_text(permit)
+        return
+    events = await try_events_answer(request_body, domain, q)
+    if events is not None:
+        yield _voice_text(events)
+        return
+    arrest = await try_arrest_answer(request_body, domain)
+    if arrest is not None:
+        yield _voice_text(arrest)
+        return
+    zoning = await try_zoning_answer(request_body, domain, q)
+    if zoning is not None:
+        yield _voice_text(zoning[0])
+        return
+    # Website: STREAM tokens as they generate -- the latency win. retrieval_query=q skips expansion.
+    if CODE_PIPELINE_ENABLED and website_pipeline and domain in ("website", "codes") and q:
+        try:
+            client = await init_openai_client()
+            emitted = False
+            async for piece in website_pipeline.stream_website_answer(
+                    q, client, app_settings.azure_openai.model,
+                    system=VOICE_SYSTEM, retrieval_query=q):
+                piece = _CITE_RE.sub("", piece)      # drop any [docN] marker that slips through
+                if piece:
+                    emitted = True
+                    yield piece
+            if emitted:
+                return
+        except Exception:
+            logging.exception("[RETELL] website stream failed")
+    yield ("I'm sorry, I don't have that information right now. You can reach the City of Burbank "
+           "at (818) 238-5800.")
+
+
 @bp.websocket("/llm-websocket/<call_id>")
 async def llm_websocket(call_id):
     """Retell Custom LLM endpoint. Handshake with a config event, then for each response_required
@@ -1510,19 +1577,26 @@ async def llm_websocket(call_id):
             messages = _retell_transcript_to_messages(event.get("transcript"))
             logging.info("[RETELL] response_required id=%s msgs=%d call=%s",
                          response_id, len(messages), call_id)
+            sent, chars = False, 0
             try:
-                answer = await run_voice_turn({"messages": messages})
+                async for piece in run_voice_turn_stream({"messages": messages}):
+                    if not piece:
+                        continue
+                    sent, chars = True, chars + len(piece)
+                    await websocket.send(json.dumps({          # each frame is a token DELTA
+                        "response_type": "response", "response_id": response_id,
+                        "content": piece, "content_complete": False}))
             except Exception:
                 logging.exception("[RETELL] voice turn failed call=%s", call_id)
-                answer = "Sorry, I ran into a problem. Could you say that again?"
-            logging.info("[RETELL] reply id=%s len=%d call=%s: %s",
-                         response_id, len(answer or ""), call_id, (answer or "")[:120])
-            await websocket.send(json.dumps({
-                "response_type": "response",
-                "response_id": response_id,
-                "content": answer,
-                "content_complete": True,
-            }))
+                if not sent:
+                    await websocket.send(json.dumps({
+                        "response_type": "response", "response_id": response_id,
+                        "content": "Sorry, I ran into a problem. Could you say that again?",
+                        "content_complete": False}))
+            await websocket.send(json.dumps({                  # close out this response_id
+                "response_type": "response", "response_id": response_id,
+                "content": "", "content_complete": True}))
+            logging.info("[RETELL] reply done id=%s chars=%d call=%s", response_id, chars, call_id)
     except asyncio.CancelledError:               # call ended / socket closed
         logging.info("[RETELL] ws CLOSED (cancelled) call=%s", call_id)
         raise

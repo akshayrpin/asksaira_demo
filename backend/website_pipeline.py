@@ -259,18 +259,17 @@ def _check_contacts(answer, source_text):
     return {"unverified_emails": bad_emails, "unverified_phones": bad_phones}
 
 
-async def answer_website_query(question, client, model, k=8, candidates=50, pool=30,
-                               page_char_cap=8000, total_char_cap=32000,
-                               system=None, retrieval_query=None):
-    """Return (answer, context). Retrieve + demote to k hit chunks, then PARENT-DOCUMENT expand:
-    reassemble each hit's whole page (its hit chunks first, then the page's other chunks) so an
-    answer split across a page's chunks stays complete (e.g. a FAQ's contact line + its how-to
-    step). Sources become one block per page, capped so a long page can't blow up the context."""
+async def _retrieve_context(question, client, model, k, candidates, pool,
+                            page_char_cap, total_char_cap, retrieval_query):
+    """Shared retrieval: embed -> hybrid search -> demote code -> parent-document expand -> build
+    the numbered source blocks + citations. Used by both answer_website_query (non-streaming) and
+    stream_website_answer (voice). Returns (sources, citations, hits, retrieve_ms, t0)."""
     t0 = time.monotonic()
     _rspan = _tracer.start_span("website.retrieve") if _tracer else None
     rq = retrieval_query or question          # zoning passes a conversation-derived retrieval query
     # Expand ONLY for the website route: retrieval_query is None means a plain website question
-    # (zoning/others supply their own retrieval query and are left untouched).
+    # (zoning/others supply their own retrieval query and are left untouched). Voice passes
+    # retrieval_query=question, so it skips this extra LLM hop for latency.
     if retrieval_query is None and QUERY_EXPANSION_ENABLED:
         rq = await _expand_query(question, client, model)
     emb = await client.embeddings.create(model=EMBED_MODEL, input=[rq])
@@ -316,6 +315,37 @@ async def answer_website_query(question, client, model, k=8, candidates=50, pool
     retrieve_ms = int((time.monotonic() - t0) * 1000)
     if _rspan:
         _rspan.end()
+    return sources, citations, hits, retrieve_ms, t0
+
+
+async def stream_website_answer(question, client, model, system=None, retrieval_query=None,
+                                k=8, candidates=50, pool=30, page_char_cap=8000,
+                                total_char_cap=32000):
+    """Voice variant: same retrieval, but STREAM the answer tokens (yield deltas) so the caller can
+    start speaking within ~1s instead of waiting for the whole answer. Skips the URL-repair /
+    observability tail (voice strips URLs anyway); pass retrieval_query=question to skip expansion."""
+    sources, _citations, _hits, retrieve_ms, _t0 = await _retrieve_context(
+        question, client, model, k, candidates, pool, page_char_cap, total_char_cap, retrieval_query)
+    sys_text = (system or SYSTEM).format(today=date.today().strftime("%A, %B %d, %Y (%Y-%m-%d)"))
+    logging.info("[WEBSITE VOICE] retrieve_ms=%d streaming answer", retrieve_ms)
+    stream = await client.chat.completions.create(
+        model=model, temperature=0, stream=True,
+        messages=[{"role": "system", "content": sys_text},
+                  {"role": "user", "content": f"Question: {question}\n\nSources:\n{sources}"}])
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+async def answer_website_query(question, client, model, k=8, candidates=50, pool=30,
+                               page_char_cap=8000, total_char_cap=32000,
+                               system=None, retrieval_query=None):
+    """Return (answer, context). Retrieve + demote to k hit chunks, then PARENT-DOCUMENT expand:
+    reassemble each hit's whole page (its hit chunks first, then the page's other chunks) so an
+    answer split across a page's chunks stays complete (e.g. a FAQ's contact line + its how-to
+    step). Sources become one block per page, capped so a long page can't blow up the context."""
+    sources, citations, hits, retrieve_ms, t0 = await _retrieve_context(
+        question, client, model, k, candidates, pool, page_char_cap, total_char_cap, retrieval_query)
 
     _tg = time.monotonic()
     _gspan = _tracer.start_span("website.generate") if _tracer else None
