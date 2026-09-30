@@ -1464,9 +1464,11 @@ VOICE_SYSTEM = (
     "- Use ONLY the numbered sources below. Never invent a name, number, date, or fact the sources "
     "don't support. If the sources don't cover it, say so briefly and give the City's main line, "
     "(818) 238-5800.\n"
-    "- Never read out a URL, email address, or a long list aloud. If there's a link, a form, or more "
-    "detail the caller would want, OFFER to text it: say something like \"I can text you the link if "
-    "you'd like.\" Do not dictate the address of a website.\n"
+    "- Never read out a full URL or a long list aloud. If there's a link, form, or portal the caller "
+    "needs, tell them WHERE to find it on the City website by section, e.g. \"on the city website "
+    "under Community Development, then Building Permits.\" Do NOT promise to text or email it -- you "
+    "cannot. A short phone number or a simple email address is fine to say when that's the action "
+    "they need.\n"
     "- Speak numbers and hours naturally (\"open weekdays, 8 to 5\", \"call eight one eight...\"). No "
     "markdown, headings, bullets, or citation markers, this is spoken aloud.\n"
     "Today is {today}."
@@ -1557,11 +1559,10 @@ async def run_voice_turn_stream(request_body):
         # Most voice turns are website. Kick off retrieval SPECULATIVELY in parallel with the router
         # (classify is ~2s on the big prompt), so retrieval hides under it; speak a filler at ~0ms to
         # hold the line. If the route turns out non-website, the speculative work is cancelled.
-        # retrieval_query=None (not q) so expansion runs INSIDE this speculative task -- "who is
-        # running for city council" needs "candidates/election" added or it lands on the current
-        # council page. Expansion overlaps classify, so it costs no critical-path time here.
+        # retrieval_query=q skips query expansion (an extra LLM hop before search). Voice prizes
+        # latency and the caller can simply rephrase if the first pass misses -- worth it for speed.
         retrieval_task = asyncio.create_task(website_pipeline._retrieve_context(
-            q, client, app_settings.azure_openai.model, 6, 30, 15, 8000, 32000, None)) \
+            q, client, app_settings.azure_openai.model, 6, 30, 15, 8000, 32000, q)) \
             if (CODE_PIPELINE_ENABLED and website_pipeline) else None
         yield "Let me check that for you."
         domain = await classify_request(request_body, q)
