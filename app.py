@@ -1557,8 +1557,11 @@ async def run_voice_turn_stream(request_body):
         # Most voice turns are website. Kick off retrieval SPECULATIVELY in parallel with the router
         # (classify is ~2s on the big prompt), so retrieval hides under it; speak a filler at ~0ms to
         # hold the line. If the route turns out non-website, the speculative work is cancelled.
+        # retrieval_query=None (not q) so expansion runs INSIDE this speculative task -- "who is
+        # running for city council" needs "candidates/election" added or it lands on the current
+        # council page. Expansion overlaps classify, so it costs no critical-path time here.
         retrieval_task = asyncio.create_task(website_pipeline._retrieve_context(
-            q, client, app_settings.azure_openai.model, 6, 30, 15, 8000, 32000, q)) \
+            q, client, app_settings.azure_openai.model, 6, 30, 15, 8000, 32000, None)) \
             if (CODE_PIPELINE_ENABLED and website_pipeline) else None
         yield "Let me check that for you."
         domain = await classify_request(request_body, q)
