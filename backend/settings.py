@@ -46,6 +46,7 @@ class _UiSettings(BaseSettings):
     chat_logo: Optional[str] = None
     chat_title: str = ""
     chat_description: str = "This chatbot is configured to answer your questions"
+    chat_subtitle: str = "Your AI guide to City services, permits, programs, and information."
     favicon: str = "/favicon.ico"
     show_share_button: bool = True
     show_chat_history_button: bool = True
@@ -64,13 +65,17 @@ class _UiSettings(BaseSettings):
     capabilities_1: Optional[str] = None
     capabilities_2: Optional[str] = None
     capabilities_3: Optional[str] = None
+    capabilities_4: Optional[str] = None
+    capabilities_5: Optional[str] = None
     limitations: Optional[str] = None
     limitations_1: Optional[str] = None
     limitations_2: Optional[str] = None
     limitations_3: Optional[str] = None
+    limitations_4: Optional[str] = None
     chat_resp_logo: Optional[str] = None
     hand_wave_icon: Optional[str] = None
     show_permit_link: bool = False
+    speaker_icon: Optional[str] = None
 
 class _ChatHistorySettings(BaseSettings):
     model_config = SettingsConfigDict(

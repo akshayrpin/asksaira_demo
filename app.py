@@ -37,6 +37,7 @@ from backend.utils import (
     format_non_streaming_response,
     convert_to_pf_format,
     format_pf_non_streaming_response,
+    BlockedTextScrubber,
 )
 
 import time
@@ -46,7 +47,30 @@ try:
 except Exception:  # missing aiohttp etc. -> feature simply stays off
     permit_agent = None
     logging.exception("permit agent unavailable; permit questions fall back to RAG")
-try:
+try:  # City calendar (events + meetings) from events.json; replaces the Granicus meetings feed
+    from backend import events as events_feed
+except Exception:
+    events_feed = None
+    logging.exception("events feed unavailable; calendar questions fall back to RAG")
+try:  # code pipeline for website questions (burbank-code-v1); opt-in via CODE_PIPELINE_ENABLED
+    from backend import website_pipeline
+except Exception:
+    website_pipeline = None
+    logging.exception("website pipeline unavailable; website questions use on-your-data")
+CODE_PIPELINE_ENABLED = bool(website_pipeline) and os.environ.get("CODE_PIPELINE_ENABLED", "0") != "0"
+
+try:  # address-specific zoning / land-use answers (answered from the code index); opt-in
+    from backend import zoning
+except Exception:
+    zoning = None
+    logging.exception("zoning route unavailable")
+ZONING_ROUTE_ENABLED = bool(zoning) and os.environ.get("ZONING_ROUTE_ENABLED", "0") != "0"
+
+# --- Transactional / staff extras (demo only) ------------------------------------------------
+# These layer on top of the RAG base: the instant-permit apply flow, the mock public-record and
+# inspection flows, and the staff-facing ePALS analytics agent. Each is an optional import + an
+# env flag, so an app without them (e.g. Hey Burbank prod) behaves as the plain RAG assistant.
+try:  # instant-permit apply flow (multi-turn, in the chat UI)
     from backend.permit_agent import apply_agent
 except Exception:  # missing deps -> apply flow simply stays off
     apply_agent = None
@@ -55,17 +79,26 @@ try:  # mock conversational flows (public-record request + inspection scheduling
     from backend.permit_agent import prr_agent, inspection_agent
 except Exception:
     prr_agent = inspection_agent = None
+    logging.exception("mock flow agents unavailable; PRR + inspection disabled")
 try:  # generic staff analytics agent over the ePALS Solr API (prefix-triggered for now)
     from backend.internals_agent import agent as internals_agent
 except Exception:
     internals_agent = None
     logging.exception("internals agent unavailable")
-    logging.exception("mock flow agents unavailable; PRR + inspection disabled")
-try:
-    from backend import meetings as meetings_feed
-except Exception:  # missing deps -> live meeting lookup stays off
-    meetings_feed = None
-    logging.exception("meetings feed unavailable; meeting questions fall back to RAG")
+
+# Arrest / police daily-log deflect. The logs update daily and can't be re-pushed that often, and
+# the model won't reliably stop enumerating/inventing per-day dates from a prompt rule, so answer
+# DETERMINISTICALLY: the classifier only routes here, the reply is fixed text (no LLM generation,
+# no retrieval), which is why it can never fabricate dates or log contents. Env-configurable.
+ARREST_ROUTE_ENABLED = os.environ.get("ARREST_ROUTE_ENABLED", "0") != "0"
+ARREST_LOG_URL = os.environ.get(
+    "ARREST_LOG_URL", "https://www.burbankca.gov/web/police-department/daily-arrest-logs")
+ARREST_ANSWER = (
+    "The Police Department's daily arrest logs are updated every day and posted on the City's "
+    "official page:\n\n" + ARREST_LOG_URL + "\n\nOpen that page and select the date you want to "
+    "view or download its log (the page covers roughly the past 30 days). The logs are public "
+    "record."
+)
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -76,7 +109,24 @@ def create_app():
     app = Quart(__name__)
     app.register_blueprint(bp)
     app.config["TEMPLATES_AUTO_RELOAD"] = True
-    
+
+    # Application Insights: emit request + dependency telemetry so the Performance (p50/p95) and
+    # Failures blades populate. Only activates when APPLICATIONINSIGHTS_CONNECTION_STRING is set
+    # (Azure injects it via the bicep app setting); local runs without it are a no-op. The OTel
+    # distro auto-instruments Flask/FastAPI but not Quart, so we wrap the ASGI app by hand to get
+    # server spans. Runs once per gunicorn worker (no preload_app), where the exporter must live.
+    _appinsights_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
+    if _appinsights_conn:
+        try:
+            from azure.monitor.opentelemetry import configure_azure_monitor
+            from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
+            configure_azure_monitor(connection_string=_appinsights_conn)
+            app.asgi_app = OpenTelemetryMiddleware(app.asgi_app)
+            logging.info("Application Insights instrumentation enabled.")
+        except Exception:
+            # Telemetry must never take the app down; degrade to no tracing.
+            logging.exception("App Insights instrumentation skipped")
+
     @app.before_serving
     async def init():
         try:
@@ -111,12 +161,8 @@ async def assets(path):
 
 # Debug settings
 DEBUG = os.environ.get("DEBUG", "false")
-log_level = logging.DEBUG if DEBUG.lower() == "true" else logging.INFO
-# force=True replaces gunicorn's root logger config (which defaults to WARNING
-# and would otherwise silence our INFO-level [USER QUERY]/[RETRIEVED CHUNKS] logs)
-logging.basicConfig(level=log_level, force=True)
-# Azure SDKs log every HTTP request/response at INFO; silence that noise
-logging.getLogger("azure").setLevel(logging.WARNING)
+if DEBUG.lower() == "true":
+    logging.basicConfig(level=logging.DEBUG)
 
 USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
 
@@ -134,6 +180,7 @@ frontend_settings = {
         "chat_logo": app_settings.ui.chat_logo or app_settings.ui.logo,
         "chat_title": app_settings.ui.chat_title,
         "chat_description": app_settings.ui.chat_description,
+        "chat_subtitle": app_settings.ui.chat_subtitle,
         "show_share_button": app_settings.ui.show_share_button,
         "show_chat_history_button": app_settings.ui.show_chat_history_button,
         "chat_response_contactmessage": app_settings.ui.chat_response_contactmessage,
@@ -150,13 +197,17 @@ frontend_settings = {
         "capabilities_1":  app_settings.ui.capabilities_1,
         "capabilities_2": app_settings.ui.capabilities_2,
         "capabilities_3": app_settings.ui.capabilities_3,
+        "capabilities_4": app_settings.ui.capabilities_4,
+        "capabilities_5": app_settings.ui.capabilities_5,
         "limitations": app_settings.ui.limitations,
         "limitations_1": app_settings.ui.limitations_1,
         "limitations_2": app_settings.ui.limitations_2,
         "limitations_3": app_settings.ui.limitations_3,
+        "limitations_4": app_settings.ui.limitations_4,
         "chat_resp_logo": app_settings.ui.chat_resp_logo,
         "hand_wave_icon": app_settings.ui.hand_wave_icon,
-        "show_permit_link": app_settings.ui.show_permit_link
+        "show_permit_link": app_settings.ui.show_permit_link,
+        "speaker_icon": app_settings.ui.speaker_icon
     },
     "sanitize_answer": app_settings.base_settings.sanitize_answer,
     "oyd_enabled": app_settings.base_settings.datasource_type,
@@ -361,8 +412,7 @@ def prepare_model_args(request_body, request_headers):
                         "embedding_dependency"
                     ]["authentication"][field] = "*****"
 
-    user_query = next((m["content"] for m in reversed(model_args_clean["messages"]) if m["role"] == "user"), None)
-    logging.info(f"[USER QUERY] {user_query}")
+    logging.debug(f"REQUEST BODY: {json.dumps(model_args_clean, indent=4)}")
 
     return model_args
 
@@ -400,27 +450,18 @@ async def promptflow_request(request):
         logging.error(f"An error occurred while making promptflow_request: {e}")
 
 
-# --- Domain routing: send each question to the right scoped index ----------------
-# website (people/officials/contacts/services/FAQs) stays on the default index;
-# permit and codes questions are rerouted to their dedicated indexes so the dense
-# municipal-code text can't drown out, or be drowned by, the other domains.
+# Domain routing (on-your-data fallback). Codes were merged into the code-pipeline index and are
+# answered by website_pipeline as 'website', so only permit records may route here (agent off).
 PERMITS_INDEX = os.environ.get("AZURE_SEARCH_INDEX_PERMITS")
 CODES_INDEX = os.environ.get("AZURE_SEARCH_INDEX_CODES")
-# Routing is OPT-IN: active only when BOTH domain indexes are configured. Apps
-# without these env vars (other cities, or prod until it's ready) behave exactly
-# as before, no classifier call, no rerouting.
+# Routing is OPT-IN: active only when BOTH domain indexes are configured. Apps without
+# these env vars behave exactly as before, no classifier call, no rerouting.
 INDEX_ROUTING_ENABLED = bool(PERMITS_INDEX and CODES_INDEX)
 
 ROUTER_SYSTEM_MESSAGE = (
     "You route a resident's question for a city government assistant to ONE data source. "
-    "Reply with exactly one lowercase word: website, permit, instant-permit, public-record, "
-    "inspection, or codes.\n"
-    "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
-    "city services, news, events, FAQs, general how-to questions, AND how to apply for or "
-    "pay for a permit, permit fees, what documents are needed, which permit you need for a "
-    "project, what permit types the city offers in general, and Building & Safety info. "
-    "EXCEPTION: any question about the five instant-permit jobs (water heater, HVAC/furnace/AC, "
-    "electrical panel, rewire, repipe) is instant-permit, not website.\n"
+    "Reply with exactly one lowercase word: website, permit, events, zoning, arrest, "
+    "instant-permit, public-record, or inspection.\n"
     "- instant-permit: use this for ANY question about one of these five specific jobs, no "
     "matter how it is phrased, whether the user wants to apply, reports a problem, or just asks "
     "about the permit for it: water heater, furnace or air conditioner/HVAC, electrical panel, "
@@ -436,6 +477,19 @@ ROUTER_SYSTEM_MESSAGE = (
     "- inspection: the user wants to SCHEDULE, book, reschedule, or move a building INSPECTION "
     "for a permit. Examples: 'schedule an inspection', 'reschedule my final inspection', 'move my "
     "inspection to Thursday'. NOT a question about which inspections are required (that is website).\n"
+    "- arrest: a request to SEE, view, get, or list the arrest log, arrest logs, booking log, or "
+    "the police daily arrest log, including for a specific day, week, month, or date range (e.g. "
+    "'show me the arrest log for last week', 'yesterday's arrests', 'arrest log for 09-01'). This "
+    "is ONLY for the daily arrest/booking log itself. How to file a police report, crime stats, or "
+    "general police-department contact are NOT arrest -> route those to website.\n"
+    "- website: people, officials, departments, contacts, phone/email, hours, addresses, "
+    "city services, news, FAQs, general how-to questions, the municipal code / ordinances / "
+    "zoning / regulations themselves (what the code or law says), AND how to apply for or "
+    "pay for a permit, permit fees, what documents are needed, which permit you need for a "
+    "project, what permit types the city offers in general, and Building & Safety info. "
+    'Examples: "how do I apply for a building permit", "how to apply for a permit online", '
+    '"what permit do I need for a fence", "what are the permit fees", "what documents do I '
+    'need for a permit".\n'
     "- permit: looking up SPECIFIC existing permit records, their status, or any COUNT, "
     "BREAKDOWN, LIST, or RANKING of permits actually filed or issued (this also covers "
     "business tax registrations and business licenses). Includes breakdowns by type, "
@@ -445,14 +499,27 @@ ROUTER_SYSTEM_MESSAGE = (
     "issued the most permits this year', 'how many new businesses opened in 2025'. Use for "
     "existing permit records and their aggregates, NOT for how to apply, fees, or what "
     "permit types exist in general.\n"
-    "- codes: the municipal code text, ordinances, or regulations themselves (zoning, "
-    "setbacks, what the code/law says).\n"
+    "- events: WHEN something is on the City calendar, its date, time, or schedule. Upcoming City "
+    "events, activities, festivals, programs, workshops, things to do, AND City Council / board / "
+    "commission MEETING dates and times (e.g. 'when is the next city council meeting', 'next "
+    "planning commission meeting'), 'what's happening', 'this weekend', the events or meetings "
+    "calendar. This covers only WHAT is scheduled and WHEN. A question about the DETAILS or "
+    "LOGISTICS of an event (street or road closures, parking, traffic, routes, rules, how to take "
+    "part) is NOT a calendar lookup, route those to website. NOT permit or code lookups.\n"
+    "- zoning: use ONLY when the resident names a SPECIFIC PROPERTY or STREET ADDRESS, or supplies a "
+    "zoning designation. Examples: 'can I open a medical office at 2019 W Magnolia', 'what can I "
+    "build at 123 N Main St', 'is a duplex allowed at [address]', and short follow-ups giving a "
+    "designation ('zoning is C-3', 'it's C-3', or just 'C-3', 'R-1', 'MDC-3') answering an earlier "
+    "property question. A GENERAL rules question with NO specific property or address is NOT zoning "
+    "-> route it to website: e.g. 'can a dumpster be put in an alley', 'how tall can a fence be', "
+    "'what are the setback requirements', 'do I need a permit for a shed'. The trigger is a named "
+    "property/address or a zoning designation; without one, it is website.\n"
     "If you are unsure, answer website."
 )
 
 
 async def classify_domain(user_query, client, history=None):
-    """Return 'website' | 'permit' | 'codes' for a question. Defaults to website on any failure.
+    """Return 'website' | 'permit' | 'events'. Defaults to website on any failure.
 
     If `history` (recent user/assistant turns, ending with the current question) is given,
     the classifier sees it so a short follow-up like 'at what locations?' inherits the topic
@@ -485,25 +552,49 @@ async def classify_domain(user_query, client, history=None):
         return "inspection"
     if "record" in label or "public" in label:
         return "public-record"
+    if "arrest" in label:
+        return "arrest" if ARREST_ROUTE_ENABLED else "website"   # off -> code pipeline, as before
+    if "zoning" in label:
+        return "zoning" if ZONING_ROUTE_ENABLED else "website"   # off -> code pipeline, as before
     if "permit" in label:
         return "permit"
-    if "code" in label:
-        return "codes"
-    return "website"
+    if "event" in label:
+        return "events"
+    return "website"    # website also covers general municipal-code / ordinance questions
 
 
-def index_for_domain(domain):
-    """Map an ALREADY-classified domain to a scoped index name, or None to keep the default
-    (website). No LLM call here; the domain was classified once via _domain_for and reused.
+def route_index(domain):
+    """Map an ALREADY-classified domain to a scoped on-your-data index, or None to keep the default.
 
-    When the permit AGENT is on, permit questions are handled by it (live records), not a
-    RAG index, so only codes reroutes here.
+    Codes were merged into the code-pipeline index (answered by website_pipeline as 'website'),
+    so they are no longer routed here. When the permit AGENT is on, permits are handled by it, so
+    in the common config this returns None for everything.
     """
     if domain == "permit" and not PERMIT_AGENT_ENABLED:
         return PERMITS_INDEX
-    if domain == "codes":
-        return CODES_INDEX
     return None
+
+
+async def classify_request(request_body, query=None):
+    """Classify the question ONCE (website | permit | events) so the permit, events, website,
+    and index-routing paths share a single classifier call instead of each making their own. Returns
+    None (skip classifying) when no routable feature is enabled or there is no question.
+    `query` is the reformulated standalone question (already history-resolved), so no history is
+    passed to the classifier; falls back to the raw latest message if not provided."""
+    if not (PERMIT_AGENT_ENABLED or EVENTS_ENABLED or CODE_PIPELINE_ENABLED
+            or INDEX_ROUTING_ENABLED or ZONING_ROUTE_ENABLED or ARREST_ROUTE_ENABLED
+            or PERMIT_APPLY_ENABLED or MOCK_FLOWS_ENABLED):
+        return None
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    user_query = query or _latest_user_query(messages)
+    if not user_query:
+        return None
+    try:
+        client = await init_openai_client()
+        return await classify_domain(user_query, client)
+    except Exception:
+        logging.exception("domain classification failed; defaulting to website")
+        return "website"
 
 
 # --- Permit agent: answer existing-permit questions from the live records ---------
@@ -529,37 +620,58 @@ def _recent_history(messages, turns=6, max_chars=700):
     return [{"role": m["role"], "content": m["content"][:max_chars]} for m in recent[-turns:]]
 
 
-async def _domain_for(request_body, client):
-    """Classify the latest question ONCE per request and cache it on request_body.
-
-    The apply, permit, and index-routing deciders all ask the same 'what domain is this?'
-    question, so we run the classifier LLM once and every consumer reuses the cached word.
-    (Mid-flow apply turns short-circuit before this, so they classify zero times.)"""
-    if "_domain" in request_body:
-        return request_body["_domain"]
-    raw = request_body.get("messages", [])
-    user_query = _latest_user_query(raw)
-    domain = "website"
-    if user_query:
-        domain = await classify_domain(user_query, client, history=_recent_history(raw))
-    request_body["_domain"] = domain
-    return domain
+_REFORMULATE_SYSTEM = (
+    "You rewrite the user's latest message into ONE standalone question for a city assistant, using "
+    "the earlier conversation ONLY to resolve references.\n"
+    "- If the latest message is a genuine follow-up that leans on an earlier turn (e.g. 'what about "
+    "in 2024?', 'and commercial ones?', or just a zoning designation like 'C-3'), rewrite it into a "
+    "full self-contained question by pulling in the needed context from that earlier turn.\n"
+    "- If the latest message is already self-contained, or is a NEW topic unrelated to the earlier "
+    "turns, output it unchanged and IGNORE the earlier turns entirely (do not carry over their "
+    "subject).\n"
+    "Output only the resulting question, nothing else."
+)
 
 
-async def try_permit_answer(request_body):
-    """If the latest question is a permit-records question, answer it from the live
-    permits index and return the answer string. Otherwise return None (run normal RAG)."""
-    if not PERMIT_AGENT_ENABLED:
+async def reformulate_query(request_body):
+    """History-aware query rewrite, run ONCE upstream of the router. Resolves a genuine follow-up
+    from the recent turns, but keeps a new/unrelated question standalone so a prior topic can't bleed
+    into retrieval or routing. Returns the query string (the raw latest message on the first turn or
+    on any failure). Downstream classify/retrieval all run on this."""
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    latest = _latest_user_query(messages)
+    hist = _recent_history(messages)
+    prior = hist[:-1] if hist else []
+    if not latest or not prior:   # nothing earlier to resolve against
+        return latest
+    try:
+        client = await init_openai_client()
+        resp = await client.chat.completions.create(
+            model=app_settings.azure_openai.model, temperature=0, max_tokens=120,
+            messages=[{"role": "system", "content": _REFORMULATE_SYSTEM}] + prior
+                     + [{"role": "user", "content": f"Latest message: {latest}\n\nStandalone question:"}])
+        rewritten = (resp.choices[0].message.content or "").strip()
+        if rewritten and rewritten != latest:
+            logging.info("[REFORMULATE] %r -> %r", latest, rewritten)
+        return rewritten or latest
+    except Exception:
+        logging.exception("query reformulation failed; using the raw latest message")
+        return latest
+
+
+async def try_permit_answer(request_body, domain, query=None):
+    """If the question is a permit-records question, answer it from the live permits index and return
+    the answer string. Otherwise return None (run normal RAG). `query` is the reformulated standalone
+    question; the raw recent history is still passed to the agent for its tool loop."""
+    if not PERMIT_AGENT_ENABLED or domain != "permit":
         return None
     messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
-    user_query = _latest_user_query(messages)
+    user_query = query or _latest_user_query(messages)
     if not user_query:
         return None
     try:
         client = await init_openai_client()
         history = _recent_history(messages)
-        if await _domain_for(request_body, client) != "permit":
-            return None
         logging.info("[PERMIT AGENT] handling: %s", user_query)
         return await permit_agent.answer_permit_query(
             user_query, client, app_settings.azure_openai.model, history=history)
@@ -568,10 +680,144 @@ async def try_permit_answer(request_body):
         return None
 
 
+# City calendar lookup (events + meetings) from events.json. Routed via the classifier's
+# 'events' domain. Replaces the Granicus meetings feed; events.json must be kept fresh.
+EVENTS_ENABLED = bool(events_feed) and events_feed.available()
+
+
+async def try_events_answer(request_body, domain, query=None):
+    """If the classifier says EVENTS (upcoming events or a Council/board/commission meeting time),
+    answer from the current events.json. Returns the answer string, or None to fall through to RAG.
+    `query` is the reformulated standalone question."""
+    if not EVENTS_ENABLED or domain != "events":
+        return None
+    try:
+        client = await init_openai_client()
+        user_query = query or _latest_user_query(request_body.get("messages", []))
+        if not user_query:
+            return None
+        logging.info("[EVENTS] handling: %s", user_query)
+        return await events_feed.answer_events_query(
+            user_query, client, app_settings.azure_openai.model, datetime.date.today())
+    except Exception:
+        logging.exception("events feed failed; falling back to RAG")
+        return None
+
+
+def _permit_message_obj(msg_id=None):
+    # unique per answer: the frontend echoes this response id as the message id (Chat.tsx),
+    # so a constant here makes every answer collide on one message doc (breaks feedback + history).
+    return {
+        "id": msg_id or str(uuid.uuid4()),
+        "model": app_settings.azure_openai.model,
+        "created": int(time.time()),
+        "object": "extensions.chat.completion",
+        "choices": [{"messages": []}],
+    }
+
+
+def permit_non_streaming_response(answer, history_metadata):
+    """Shape a permit answer exactly like format_non_streaming_response output."""
+    obj = _permit_message_obj()
+    obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
+    obj["history_metadata"] = history_metadata
+    obj["apim-request-id"] = obj["id"]
+    return obj
+
+
+def permit_stream_response(answer, history_metadata):
+    """A one-chunk async stream shaped like format_stream_response output."""
+    async def generate():
+        obj = _permit_message_obj()
+        obj["object"] = "extensions.chat.completion.chunk"
+        obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
+        obj["history_metadata"] = history_metadata
+        obj["apim-request-id"] = obj["id"]
+        yield obj
+    return generate()
+
+
+def _website_messages(answer, context):
+    """Tool (citations) + assistant, same shape on-your-data produces, so the frontend renders
+    citations identically."""
+    return [{"role": "tool", "content": json.dumps(context)},
+            {"role": "assistant", "content": answer}]
+
+
+def website_non_streaming_response(answer, context, history_metadata, answer_id=None):
+    obj = _permit_message_obj(answer_id)
+    obj["choices"][0]["messages"] = _website_messages(answer, context)
+    obj["history_metadata"] = history_metadata
+    obj["apim-request-id"] = obj["id"]
+    return obj
+
+
+def website_stream_response(answer, context, history_metadata, answer_id=None):
+    async def generate():
+        obj = _permit_message_obj(answer_id)
+        obj["object"] = "extensions.chat.completion.chunk"
+        obj["choices"][0]["messages"] = _website_messages(answer, context)
+        obj["history_metadata"] = history_metadata
+        obj["apim-request-id"] = obj["id"]
+        yield obj
+    return generate()
+
+
+async def try_arrest_answer(request_body, domain):
+    """Arrest / daily-log requests -> a FIXED deflect to the live arrest log page. Deterministic
+    (no LLM, no retrieval) so it can't enumerate or invent daily-log dates or contents. Returns the
+    canned answer string, or None to fall through."""
+    if not ARREST_ROUTE_ENABLED or domain != "arrest":
+        return None
+    logging.info("[ARREST] deflect to %s", ARREST_LOG_URL)
+    return ARREST_ANSWER
+
+
+async def try_zoning_answer(request_body, domain, query=None):
+    """Address-specific zoning / land-use questions -> answered from the code index with a zoning
+    prompt (asks for the designation if absent, else answers from the code). Returns website_pipeline's
+    (answer, context, answer_id) or None to fall through. `query` is the reformulated standalone
+    question (a bare 'C-3' follow-up is already resolved upstream, so no concatenation here)."""
+    if not ZONING_ROUTE_ENABLED or domain != "zoning":
+        return None
+    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    q = query or _latest_user_query(messages)
+    if not q:
+        return None
+    try:
+        client = await init_openai_client()
+        logging.info("[ZONING] %s", q)
+        return await zoning.answer_zoning_query(q, client, app_settings.azure_openai.model)
+    except Exception:
+        logging.exception("zoning route failed; falling back")
+        return None
+
+
+async def try_website_answer(request_body, domain, query=None):
+    """If enabled and the classifier says WEBSITE, answer from burbank-code-v1 (hybrid + semantic
+    rerank + in-depth prompt). Returns (answer, context) or None to fall through to on-your-data.
+    Municipal-code questions now classify as WEBSITE and are answered here too; permit/meetings
+    never reach here. `query` is the reformulated standalone question."""
+    if not CODE_PIPELINE_ENABLED or domain != "website":
+        return None
+    try:
+        client = await init_openai_client()
+        q = query or _latest_user_query(request_body.get("messages", []))
+        if not q:
+            return None
+        logging.info("[CODE PIPELINE] website: %s", q)
+        # reuse the chat completion's own id (resp.id) as the response/message id, no invented uuid
+        return await website_pipeline.answer_website_query(
+            q, client, app_settings.azure_openai.model)
+    except Exception:
+        logging.exception("website pipeline failed; falling back to on-your-data")
+        return None
+
+
+# --- Staff internals agent (demo) -------------------------------------------------
 # Generic staff analytics agent over the ePALS Solr API. TEST trigger: a message starting with
-# "Internals - " routes here and the prefix is stripped (later this becomes a dedicated API for the
-# ePALS team). The prefix is the only gate, so it never intercepts normal resident traffic.
-# TEST trigger: a message like "Internals - ...", tolerant of singular/plural, case, and dash/colon.
+# "Internals - " routes here and the prefix is stripped. The prefix is the only gate, so it never
+# intercepts normal resident traffic. Tolerant of singular/plural, case, and dash/colon.
 _INTERNALS_RE = re.compile(r"^\s*internals?\s*[-:]\s*", re.IGNORECASE)
 INTERNALS_AGENT_ENABLED = bool(internals_agent) and os.environ.get("INTERNALS_AGENT_ENABLED", "1") != "0"
 
@@ -599,60 +845,6 @@ async def try_internals_answer(request_body):
         # The prefix already committed this to internals; surface the error rather than silently
         # falling through to the permit agent / RAG, which would give a misleading answer.
         return "Sorry, the internals data service hit an error handling that request. Please try again."
-
-
-# Live meeting-schedule lookup (Burbank-specific: only active when its Granicus feed URL is set).
-MEETINGS_ENABLED = bool(meetings_feed) and bool(os.environ.get("MEETINGS_FEED_URL"))
-
-
-async def try_meetings_answer(request_body):
-    """Answer 'when is the next <body> meeting' from the live Granicus feed. Returns the answer
-    string, or None to fall through to RAG. Off unless MEETINGS_FEED_URL is set."""
-    if not MEETINGS_ENABLED:
-        return None
-    messages = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
-    user_query = _latest_user_query(messages)
-    if not user_query or not meetings_feed.is_meeting_query(user_query):
-        return None
-    try:
-        answer = await meetings_feed.answer_meeting_query(user_query, datetime.date.today())
-        if answer:
-            logging.info("[MEETINGS FEED] handled: %s", user_query)
-        return answer
-    except Exception:
-        logging.exception("meetings feed failed; falling back to RAG")
-        return None
-
-
-def _permit_message_obj():
-    return {
-        "id": "permit-agent",
-        "model": app_settings.azure_openai.model,
-        "created": int(time.time()),
-        "object": "extensions.chat.completion",
-        "choices": [{"messages": []}],
-    }
-
-
-def permit_non_streaming_response(answer, history_metadata):
-    """Shape a permit answer exactly like format_non_streaming_response output."""
-    obj = _permit_message_obj()
-    obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
-    obj["history_metadata"] = history_metadata
-    obj["apim-request-id"] = "permit-agent"
-    return obj
-
-
-def permit_stream_response(answer, history_metadata):
-    """A one-chunk async stream shaped like format_stream_response output."""
-    async def generate():
-        obj = _permit_message_obj()
-        obj["object"] = "extensions.chat.completion.chunk"
-        obj["choices"][0]["messages"].append({"role": "assistant", "content": answer})
-        obj["history_metadata"] = history_metadata
-        obj["apim-request-id"] = "permit-agent"
-        yield obj
-    return generate()
 
 
 # --- Instant-permit APPLY flow (multi-turn, in the chat UI) -----------------------
@@ -770,9 +962,10 @@ async def _apply_offer_text(history, client, model):
             "Want me to help you apply now?")
 
 
-async def try_apply_answer(request_body):
+async def try_apply_answer(request_body, domain):
     """Drive the instant-permit apply flow. Returns None to fall through to normal routing,
-    otherwise {"reply": str, "in_flow": bool}. We skip the classifier when already mid-flow."""
+    otherwise {"reply": str, "in_flow": bool}. Mid-flow turns are handled off the flow tag
+    (no classifier); a fresh message uses the pre-computed `domain`."""
     if not PERMIT_APPLY_ENABLED:
         return None
     raw = request_body.get("messages", [])
@@ -828,8 +1021,8 @@ async def try_apply_answer(request_body):
             logging.info("[APPLY AGENT] offer accepted -> entering flow")
             return await run_agent()
 
-        # 4) fresh message -> classify; on instant-permit intent, OFFER first (no RAG, no collection yet)
-        if await _domain_for(request_body, client) != "instant-permit":
+        # 4) fresh message -> on instant-permit intent, OFFER first (no RAG, no collection yet)
+        if domain != "instant-permit":
             return None
         logging.info("[APPLY AGENT] offering apply: %s", user_query)
         offer = await _apply_offer_text(history, client, app_settings.azure_openai.model)
@@ -902,8 +1095,8 @@ def detect_inspection_query(query):
     return any(v in q for v in _INSPECTION_VERBS)
 
 
-async def try_prr_answer(request_body):
-    """Public-record request flow: keyword -> offer -> single form window -> review -> mock ref."""
+async def try_prr_answer(request_body, domain):
+    """Public-record request flow: keyword/classifier -> offer -> single form window -> review -> mock ref."""
     if not MOCK_FLOWS_ENABLED:
         return None
     raw = request_body.get("messages", [])
@@ -931,7 +1124,7 @@ async def try_prr_answer(request_body):
                         "in_flow": False, "widget": None, "flow": PRR_FLOW}
             return await run_agent()
         # fresh: keyword OR the classifier must say public-record, then offer before the form
-        if not detect_prr_query(user_query) and await _domain_for(request_body, client) != "public-record":
+        if not detect_prr_query(user_query) and domain != "public-record":
             return None
         logging.info("[PRR AGENT] offering: %s", user_query)
         offer = ("I can help you submit a public records request right here. "
@@ -943,8 +1136,8 @@ async def try_prr_answer(request_body):
         return None
 
 
-async def try_inspection_answer(request_body):
-    """Inspection flow: keyword -> conversational schedule/reschedule -> mock confirmation."""
+async def try_inspection_answer(request_body, domain):
+    """Inspection flow: keyword/classifier -> conversational schedule/reschedule -> mock confirmation."""
     if not MOCK_FLOWS_ENABLED:
         return None
     raw = request_body.get("messages", [])
@@ -957,7 +1150,7 @@ async def try_inspection_answer(request_body):
     try:
         client = await init_openai_client()
         if _last_bot_flow(raw) != INSPECTION_FLOW:       # fresh: keyword OR classifier must say inspection
-            if not detect_inspection_query(user_query) and await _domain_for(request_body, client) != "inspection":
+            if not detect_inspection_query(user_query) and domain != "inspection":
                 return None
         logging.info("[INSPECTION AGENT] handling: %s", user_query)
         result = await inspection_agent.answer_inspection_query(
@@ -971,40 +1164,29 @@ async def try_inspection_answer(request_body):
         return None
 
 
-async def send_chat_request(request_body, request_headers):
+async def send_chat_request(request_body, request_headers, domain=None):
     filtered_messages = []
     messages = request_body.get("messages", [])
     for message in messages:
         if message.get("role") != 'tool':
             filtered_messages.append(message)
-
+            
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
 
     try:
         azure_openai_client = await init_openai_client()
 
-        # Route this question to the right scoped index (website stays default). Reuse the
-        # single cached classification; only classifies here if nothing did so earlier.
+        # Route this question to the right scoped index (website stays default).
         if INDEX_ROUTING_ENABLED and app_settings.datasource and model_args.get("extra_body"):
-            domain = await _domain_for(request_body, azure_openai_client)
-            routed_index = index_for_domain(domain)
+            routed_index = route_index(domain)
             if routed_index:
                 model_args["extra_body"]["data_sources"][0]["parameters"]["index_name"] = routed_index
                 logging.info(f"[ROUTED INDEX] {routed_index}")
 
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id")
-
-        if not app_settings.azure_openai.stream:
-            message = response.choices[0].message
-            logging.info(f"[OPENAI RESPONSE] {message.content}")
-            context = getattr(message, "context", None)
-            if context:
-                if isinstance(context, dict) and context.get("intent"):
-                    logging.info(f"[REFORMULATED QUERY] {context['intent']}")
-                logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
+        apim_request_id = raw_response.headers.get("apim-request-id") 
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
@@ -1024,86 +1206,135 @@ async def complete_chat_request(request_body, request_headers):
         )
     else:
         history_metadata = request_body.get("history_metadata", {})
+        raw = request_body.get("messages", [])
         # Staff internals agent, prefix-triggered ("Internals - ..."), checked before everything.
         internals_answer = await try_internals_answer(request_body)
         if internals_answer is not None:
             return permit_non_streaming_response(internals_answer, history_metadata)
-        # Keyword-triggered mock flows first: their detection is specific, and 'apply for a
-        # prr' would otherwise pattern-match the instant-permit classifier and get hijacked.
-        prr_answer = await try_prr_answer(request_body)
+        # Mid-flow transactional turns (apply/prr/inspection) are handled off the flow tag with NO
+        # reformulate/classify, so a field value like "John Smith" is never rewritten or rerouted.
+        mid_flow = _flow_family(_last_bot_flow(raw)) is not None
+        if mid_flow:
+            q, domain = None, None
+        else:
+            q = await reformulate_query(request_body)          # history-resolved standalone query, ONCE
+            domain = await classify_request(request_body, q)   # classify ONCE; reused by every route
+        # Transactional flows first (keyword/classifier-triggered, or mid-flow), then the RAG cascade.
+        prr_answer = await try_prr_answer(request_body, domain)
         if prr_answer is not None:
             return apply_non_streaming_response(prr_answer["reply"], prr_answer["in_flow"],
                                                 history_metadata, prr_answer.get("widget"),
                                                 prr_answer.get("flow", PRR_FLOW))
-        inspection_answer = await try_inspection_answer(request_body)
+        inspection_answer = await try_inspection_answer(request_body, domain)
         if inspection_answer is not None:
             return apply_non_streaming_response(inspection_answer["reply"], inspection_answer["in_flow"],
                                                 history_metadata, inspection_answer.get("widget"),
                                                 inspection_answer.get("flow", INSPECTION_FLOW))
-        apply_answer = await try_apply_answer(request_body)
+        apply_answer = await try_apply_answer(request_body, domain)
         if apply_answer is not None:
             return apply_non_streaming_response(apply_answer["reply"], apply_answer["in_flow"],
                                                 history_metadata, apply_answer.get("widget"),
                                                 apply_answer.get("flow", APPLY_FLOW))
-        permit_answer = await try_permit_answer(request_body)
+        permit_answer = await try_permit_answer(request_body, domain, q)
         if permit_answer is not None:
             return permit_non_streaming_response(permit_answer, history_metadata)
-        meetings_answer = await try_meetings_answer(request_body)
-        if meetings_answer is not None:
-            return permit_non_streaming_response(meetings_answer, history_metadata)
-        response, apim_request_id = await send_chat_request(request_body, request_headers)
+        events_answer = await try_events_answer(request_body, domain, q)
+        if events_answer is not None:
+            return permit_non_streaming_response(events_answer, history_metadata)
+        arrest_answer = await try_arrest_answer(request_body, domain)
+        if arrest_answer is not None:
+            return permit_non_streaming_response(arrest_answer, history_metadata)
+        zoning_answer = await try_zoning_answer(request_body, domain, q)
+        if zoning_answer is not None:
+            return website_non_streaming_response(zoning_answer[0], zoning_answer[1], history_metadata, zoning_answer[2])
+        website = await try_website_answer(request_body, domain, q)   # website/codes -> code pipeline
+        if website is not None:
+            return website_non_streaming_response(website[0], website[1], history_metadata, website[2])
+        response, apim_request_id = await send_chat_request(request_body, request_headers, domain)
         return format_non_streaming_response(response, history_metadata, apim_request_id)
 
 
 async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
+    raw = request_body.get("messages", [])
     # Staff internals agent, prefix-triggered ("Internals - ..."), checked before everything.
     internals_answer = await try_internals_answer(request_body)
     if internals_answer is not None:
         return permit_stream_response(internals_answer, history_metadata)
-    # Keyword-triggered mock flows first (see complete_chat_request note).
-    prr_answer = await try_prr_answer(request_body)
+    # Mid-flow transactional turns (apply/prr/inspection) are handled off the flow tag with NO
+    # reformulate/classify, so a field value like "John Smith" is never rewritten or rerouted.
+    mid_flow = _flow_family(_last_bot_flow(raw)) is not None
+    if mid_flow:
+        q, domain = None, None
+    else:
+        q = await reformulate_query(request_body)          # history-resolved standalone query, ONCE
+        domain = await classify_request(request_body, q)   # classify ONCE; reused by every route
+    # Transactional flows first (keyword/classifier-triggered, or mid-flow), then the RAG cascade.
+    prr_answer = await try_prr_answer(request_body, domain)
     if prr_answer is not None:
         return apply_stream_response(prr_answer["reply"], prr_answer["in_flow"],
                                      history_metadata, prr_answer.get("widget"),
                                      prr_answer.get("flow", PRR_FLOW))
-    inspection_answer = await try_inspection_answer(request_body)
+    inspection_answer = await try_inspection_answer(request_body, domain)
     if inspection_answer is not None:
         return apply_stream_response(inspection_answer["reply"], inspection_answer["in_flow"],
                                      history_metadata, inspection_answer.get("widget"),
                                      inspection_answer.get("flow", INSPECTION_FLOW))
-    apply_answer = await try_apply_answer(request_body)
+    apply_answer = await try_apply_answer(request_body, domain)
     if apply_answer is not None:
         return apply_stream_response(apply_answer["reply"], apply_answer["in_flow"],
                                      history_metadata, apply_answer.get("widget"),
                                      apply_answer.get("flow", APPLY_FLOW))
-    permit_answer = await try_permit_answer(request_body)
+    permit_answer = await try_permit_answer(request_body, domain, q)
     if permit_answer is not None:
         return permit_stream_response(permit_answer, history_metadata)
-    meetings_answer = await try_meetings_answer(request_body)
-    if meetings_answer is not None:
-        return permit_stream_response(meetings_answer, history_metadata)
-    response, apim_request_id = await send_chat_request(request_body, request_headers)
+    events_answer = await try_events_answer(request_body, domain, q)
+    if events_answer is not None:
+        return permit_stream_response(events_answer, history_metadata)
+    arrest_answer = await try_arrest_answer(request_body, domain)
+    if arrest_answer is not None:
+        return permit_stream_response(arrest_answer, history_metadata)
+    zoning_answer = await try_zoning_answer(request_body, domain, q)
+    if zoning_answer is not None:
+        return website_stream_response(zoning_answer[0], zoning_answer[1], history_metadata, zoning_answer[2])
+    website = await try_website_answer(request_body, domain, q)   # website/codes -> code pipeline
+    if website is not None:
+        return website_stream_response(website[0], website[1], history_metadata, website[2])
+    response, apim_request_id = await send_chat_request(request_body, request_headers, domain)
 
     async def generate():
-        context_logged = False
-        full_response = []
+        scrubber = BlockedTextScrubber()
+        meta = None
         async for completionChunk in response:
-            if len(completionChunk.choices) > 0:
-                delta = completionChunk.choices[0].delta
-                if not context_logged:
-                    context = getattr(delta, "context", None)
-                    if context:
-                        if isinstance(context, dict) and context.get("intent"):
-                            logging.info(f"[REFORMULATED QUERY] {context['intent']}")
-                        logging.info(f"[RETRIEVED CHUNKS] {json.dumps(context, indent=2)}")
-                        context_logged = True
-                if getattr(delta, "content", None):
-                    full_response.append(delta.content)
-            formatted = format_stream_response(completionChunk, history_metadata, apim_request_id)
-            yield formatted
-        if full_response:
-            logging.info(f"[OPENAI RESPONSE] {''.join(full_response)}")
+            obj = format_stream_response(completionChunk, history_metadata, apim_request_id)
+            if not obj:
+                continue
+            messages = obj.get("choices", [{}])[0].get("messages", [])
+            content_msg = next(
+                (m for m in messages if m.get("role") == "assistant" and "content" in m),
+                None,
+            )
+            if content_msg is not None:
+                meta = {k: obj.get(k) for k in ("id", "model", "created", "object")}
+                emitted = scrubber.feed(content_msg["content"])
+                if not emitted:
+                    continue
+                content_msg["content"] = emitted
+                yield obj
+            else:
+                yield obj  # context / citation messages pass through untouched
+        tail = scrubber.flush()
+        if tail:
+            base = meta or {
+                "id": "", "model": "", "created": int(time.time()),
+                "object": "extensions.chat.completion.chunk",
+            }
+            yield {
+                **base,
+                "choices": [{"messages": [{"role": "assistant", "content": tail}]}],
+                "history_metadata": history_metadata,
+                "apim-request-id": apim_request_id,
+            }
 
     return generate()
 
@@ -1168,15 +1399,6 @@ async def internals_api():
         return jsonify({"error": "internal error"}), 500
 
 
-@bp.route("/frontend_settings", methods=["GET"])
-def get_frontend_settings():
-    try:
-        return jsonify(frontend_settings), 200
-    except Exception as e:
-        logging.exception("Exception in /frontend_settings")
-        return jsonify({"error": str(e)}), 500
-
-
 @bp.route("/apply/address-search", methods=["GET"])
 async def apply_address_search():
     """Type-ahead search for the instant-permit address widget. Backed by the once-cached
@@ -1215,6 +1437,15 @@ async def apply_permit_pdf():
         return jsonify({"error": "report unavailable"}), 502
     return Response(pdf, mimetype="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="permit-{permit}.pdf"'})
+
+
+@bp.route("/frontend_settings", methods=["GET"])
+def get_frontend_settings():
+    try:
+        return jsonify(frontend_settings), 200
+    except Exception as e:
+        logging.exception("Exception in /frontend_settings")
+        return jsonify({"error": str(e)}), 500
 
 
 ## Conversation History API ##

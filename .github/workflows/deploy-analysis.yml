@@ -1,0 +1,48 @@
+name: Build and deploy analysis dashboard (Container App)
+
+# Auto-deploys the retrieval-observability dashboard (analysis/) to the asksaira-analysis
+# Azure Container App whenever files under analysis/ change on main. Mirrors the manual
+# flow that works: az acr build -> az containerapp update, with the commit SHA as the tag
+# (unique per commit, so a new revision always rolls).
+
+on:
+  push:
+    branches:
+      - burbank
+    paths:
+      - 'analysis/**'
+  workflow_dispatch:      # allow manual runs from the Actions tab
+
+env:
+  RESOURCE_GROUP: rgburbank
+  CONTAINERAPP: asksaira-analysis
+  ACR: ca1f0ddcf8c1acr
+  IMAGE: asksaira-analysis
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: 'Production'         # match the other workflows' OIDC federated subject
+    permissions:
+      id-token: write            # required for azure/login OIDC
+      contents: read             # required for actions/checkout
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_4904B753C19348F7AFAC4E1F6E0AB32A }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_30524BF40FA343908CABAA99333C2785 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_895CF0DF2EC441F6B6F7CDAE9C9A3AE8 }}
+
+      - name: Build image in ACR
+        run: az acr build --registry "$ACR" --image "$IMAGE:${{ github.sha }}" ./analysis
+
+      - name: Update Container App
+        run: |
+          az containerapp update \
+            --name "$CONTAINERAPP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR.azurecr.io/$IMAGE:${{ github.sha }}"

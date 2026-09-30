@@ -1,10 +1,62 @@
 import os
+import re
 import json
 import logging
 import requests
 import dataclasses
 
 from typing import List
+
+# Contact emails the bot must never surface in an answer, even if a retrieved
+# document contains them. Each blocked address is replaced with REPLACEMENT_EMAIL
+# so the answer keeps a valid contact instead of a dangling "Email:" label.
+BLOCKED_EMAILS = ["cdd-license@burbankca.gov"]
+REPLACEMENT_EMAIL = "license@burbankca.gov"
+_BLOCKED_RE = (
+    re.compile("|".join(re.escape(e) for e in BLOCKED_EMAILS), re.IGNORECASE)
+    if BLOCKED_EMAILS
+    else None
+)
+_BLOCKED_HOLD = max((len(e) for e in BLOCKED_EMAILS), default=0) - 1
+
+
+def scrub_blocked(text):
+    """Replace any blocked email in a complete string (non-streaming path)."""
+    if not text or not _BLOCKED_RE:
+        return text
+    return _BLOCKED_RE.sub(REPLACEMENT_EMAIL, text)
+
+
+class BlockedTextScrubber:
+    """Stateful scrubber for streamed content.
+
+    A blocked email can be split across content deltas (e.g. "cdd-lic" then
+    "ense@burbankca.gov"), so a per-chunk replace would miss it. This buffers a
+    tail of (longest blocked string - 1) characters and only releases text once
+    it can no longer become part of a blocked match.
+    """
+
+    def __init__(self):
+        self._buf = ""
+
+    def feed(self, text):
+        if not _BLOCKED_RE:
+            return text or ""
+        self._buf += text or ""
+        self._buf = _BLOCKED_RE.sub(REPLACEMENT_EMAIL, self._buf)
+        if _BLOCKED_HOLD <= 0:
+            out, self._buf = self._buf, ""
+            return out
+        if len(self._buf) > _BLOCKED_HOLD:
+            out = self._buf[:-_BLOCKED_HOLD]
+            self._buf = self._buf[-_BLOCKED_HOLD:]
+            return out
+        return ""
+
+    def flush(self):
+        out = _BLOCKED_RE.sub(REPLACEMENT_EMAIL, self._buf) if _BLOCKED_RE else self._buf
+        self._buf = ""
+        return out
 
 DEBUG = os.environ.get("DEBUG", "false")
 if DEBUG.lower() == "true":
@@ -99,7 +151,7 @@ def format_non_streaming_response(chatCompletion, history_metadata, apim_request
             response_obj["choices"][0]["messages"].append(
                 {
                     "role": "assistant",
-                    "content": message.content,
+                    "content": scrub_blocked(message.content),
                 }
             )
             return response_obj
