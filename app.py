@@ -1482,40 +1482,52 @@ async def run_voice_turn(request_body):
 @bp.websocket("/llm-websocket/<call_id>")
 async def llm_websocket(call_id):
     """Retell Custom LLM endpoint. Handshake with a config event, then for each response_required
-    turn run the brain and stream the answer back. ping_pong is echoed; update_only is ignored."""
-    await websocket.send(json.dumps({
-        "response_type": "config",
-        "config": {"auto_reconnect": True, "call_details": False},
-    }))
-    while True:
-        try:
-            raw = await websocket.receive()
-        except asyncio.CancelledError:      # call ended / socket closed
-            break
-        try:
-            event = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        itype = event.get("interaction_type")
-        if itype == "ping_pong":
-            await websocket.send(json.dumps({
-                "response_type": "ping_pong", "timestamp": event.get("timestamp")}))
-            continue
-        if itype not in ("response_required", "reminder_required"):
-            continue                         # update_only / call_details -> nothing to say
-        response_id = event.get("response_id")
-        messages = _retell_transcript_to_messages(event.get("transcript"))
-        try:
-            answer = await run_voice_turn({"messages": messages})
-        except Exception:
-            logging.exception("voice turn failed for call %s", call_id)
-            answer = "Sorry, I ran into a problem. Could you say that again?"
+    turn run the brain and stream the answer back. ping_pong is echoed; update_only is ignored.
+    Verbose logging (grep [RETELL]) while we bring the voice channel up."""
+    logging.info("[RETELL] ws OPEN call=%s", call_id)
+    try:
         await websocket.send(json.dumps({
-            "response_type": "response",
-            "response_id": response_id,
-            "content": answer,
-            "content_complete": True,
+            "response_type": "config",
+            "config": {"auto_reconnect": True, "call_details": False},
         }))
+        logging.info("[RETELL] sent config call=%s", call_id)
+        while True:
+            raw = await websocket.receive()
+            try:
+                event = json.loads(raw)
+            except (TypeError, ValueError):
+                logging.warning("[RETELL] non-JSON frame call=%s: %r", call_id, str(raw)[:200])
+                continue
+            itype = event.get("interaction_type")
+            logging.info("[RETELL] event=%s keys=%s call=%s", itype, list(event.keys()), call_id)
+            if itype == "ping_pong":
+                await websocket.send(json.dumps({
+                    "response_type": "ping_pong", "timestamp": event.get("timestamp")}))
+                continue
+            if itype not in ("response_required", "reminder_required"):
+                continue                         # update_only / call_details -> nothing to say
+            response_id = event.get("response_id")
+            messages = _retell_transcript_to_messages(event.get("transcript"))
+            logging.info("[RETELL] response_required id=%s msgs=%d call=%s",
+                         response_id, len(messages), call_id)
+            try:
+                answer = await run_voice_turn({"messages": messages})
+            except Exception:
+                logging.exception("[RETELL] voice turn failed call=%s", call_id)
+                answer = "Sorry, I ran into a problem. Could you say that again?"
+            logging.info("[RETELL] reply id=%s len=%d call=%s: %s",
+                         response_id, len(answer or ""), call_id, (answer or "")[:120])
+            await websocket.send(json.dumps({
+                "response_type": "response",
+                "response_id": response_id,
+                "content": answer,
+                "content_complete": True,
+            }))
+    except asyncio.CancelledError:               # call ended / socket closed
+        logging.info("[RETELL] ws CLOSED (cancelled) call=%s", call_id)
+        raise
+    except Exception:
+        logging.exception("[RETELL] ws ERROR call=%s", call_id)
 
 
 # Generic ePALS analytics agent exposed as an API for the ePALS team to integrate. Distinct from
