@@ -17,6 +17,7 @@ from quart import (
     send_from_directory,
     render_template,
     current_app,
+    websocket,
 )
 
 from openai import AsyncAzureOpenAI
@@ -793,11 +794,12 @@ async def try_zoning_answer(request_body, domain, query=None):
         return None
 
 
-async def try_website_answer(request_body, domain, query=None):
+async def try_website_answer(request_body, domain, query=None, system=None):
     """If enabled and the classifier says WEBSITE, answer from burbank-code-v1 (hybrid + semantic
     rerank + in-depth prompt). Returns (answer, context) or None to fall through to on-your-data.
     Municipal-code questions now classify as WEBSITE and are answered here too; permit/meetings
-    never reach here. `query` is the reformulated standalone question."""
+    never reach here. `query` is the reformulated standalone question. `system` overrides the answer
+    prompt (the voice channel passes a brief, phone-friendly prompt)."""
     if not CODE_PIPELINE_ENABLED or domain != "website":
         return None
     try:
@@ -808,7 +810,7 @@ async def try_website_answer(request_body, domain, query=None):
         logging.info("[CODE PIPELINE] website: %s", q)
         # reuse the chat completion's own id (resp.id) as the response/message id, no invented uuid
         return await website_pipeline.answer_website_query(
-            q, client, app_settings.azure_openai.model)
+            q, client, app_settings.azure_openai.model, system=system)
     except Exception:
         logging.exception("website pipeline failed; falling back to on-your-data")
         return None
@@ -1366,6 +1368,154 @@ async def conversation():
     request_json = await request.get_json()
 
     return await conversation_internal(request_json, request.headers)
+
+
+# ---------------------------------------------------------------------------------------------
+# Voice channel (Retell Custom LLM websocket).
+#
+# Retell owns the phone call, STT, TTS, and turn-taking; it connects to /llm-websocket/<call_id>
+# and, each user turn, sends a `response_required` event with the full transcript. We run the SAME
+# brain as the web chat (reformulate -> classify -> the try_* cascade) and stream back plain text
+# for Retell to speak. This is the "imported by web AND voice -- same code" cognitive layer.
+#
+# SLICE 1: website Q&A + single-shot lookups (permit/events/arrest/zoning) -- all stateless per
+# turn, so they work over voice as-is. The transactional flows (apply/prr/inspection) carry their
+# step state in a tool message the WEB frontend round-trips; Retell's transcript has no such
+# message, so multi-turn flows can't hold state yet. They still give a correct FIRST prompt; full
+# multi-turn voice flows come in slice 2 (per-call state keyed by call_id).
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")   # [text](url) -> text
+_CITE_RE = re.compile(r"\s*\[doc\d+\]")                   # drop [doc1] citation markers
+
+
+def _voice_text(text):
+    """Flatten an answer written for the screen into something a TTS voice should read: strip
+    markdown links to their label, remove citation markers and heading/bold markup, collapse
+    whitespace. URLs don't belong in speech -- the SMS side-channel delivers those later."""
+    if not text:
+        return ""
+    t = _MD_LINK_RE.sub(r"\1", text)
+    t = _CITE_RE.sub("", t)
+    t = re.sub(r"[*#`>]+", "", t)
+    t = re.sub(r"\n{2,}", ". ", t).replace("\n", " ")
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+def _retell_transcript_to_messages(transcript):
+    """Retell utterances use role 'agent'/'user'; map to our 'assistant'/'user' message shape."""
+    msgs = []
+    for u in transcript or []:
+        content = (u.get("content") or "").strip()
+        if not content:
+            continue
+        msgs.append({"role": "assistant" if u.get("role") == "agent" else "user",
+                     "content": content})
+    return msgs
+
+
+# The web answer prompt tells the model to be THOROUGH (full requirements, exceptions, fees). That
+# is right on screen and unbearable over the phone. For voice we swap in a brief, spoken-style
+# prompt so answers are BORN short (1-2 sentences) instead of generated long and truncated. It
+# still grounds strictly in the numbered sources -- it fully REPLACES the web prompt, so the
+# grounding rules have to live here too.
+VOICE_SYSTEM = (
+    "You are the City of Burbank's assistant answering over the PHONE. The person is listening, not "
+    "reading, so be brief and conversational.\n"
+    "- Answer in 1-2 short spoken sentences (at most 3 for a genuinely multi-part question). Lead "
+    "with the single most useful fact; do NOT list everything.\n"
+    "- Use ONLY the numbered sources below. Never invent a name, number, date, or fact the sources "
+    "don't support. If the sources don't cover it, say so briefly and give the City's main line, "
+    "(818) 238-5800.\n"
+    "- Never read out a URL, email address, or a long list aloud. If there's a link, a form, or more "
+    "detail the caller would want, OFFER to text it: say something like \"I can text you the link if "
+    "you'd like.\" Do not dictate the address of a website.\n"
+    "- Speak numbers and hours naturally (\"open weekdays, 8 to 5\", \"call eight one eight...\"). No "
+    "markdown, headings, bullets, or citation markers, this is spoken aloud.\n"
+    "Today is {today}."
+)
+
+
+async def run_voice_turn(request_body):
+    """One turn through the same dispatch as complete_chat_request, returning PLAIN TEXT for TTS
+    (no widgets, no response objects). Mirrors the cascade so voice and web answer identically."""
+    raw = request_body.get("messages", [])
+    if not any(m.get("role") == "user" and m.get("content") for m in raw):
+        return "Hi, this is the City of Burbank assistant. How can I help you today?"
+    internals = await try_internals_answer(request_body)
+    if internals is not None:
+        return _voice_text(internals)
+    # Mid-flow transactional turns keep NO reformulate/classify (a spoken field value must not be
+    # rewritten or rerouted). Over voice this can only detect a flow the same turn started it.
+    mid_flow = _flow_family(_last_bot_flow(raw)) is not None
+    if mid_flow:
+        q, domain = None, None
+    else:
+        q = await reformulate_query(request_body)
+        domain = await classify_request(request_body, q)
+    prr = await try_prr_answer(request_body, domain)
+    if prr is not None:
+        return _voice_text(prr["reply"])
+    inspection = await try_inspection_answer(request_body, domain)
+    if inspection is not None:
+        return _voice_text(inspection["reply"])
+    apply_ans = await try_apply_answer(request_body, domain)
+    if apply_ans is not None:
+        return _voice_text(apply_ans["reply"])
+    permit = await try_permit_answer(request_body, domain, q)
+    if permit is not None:
+        return _voice_text(permit)
+    events = await try_events_answer(request_body, domain, q)
+    if events is not None:
+        return _voice_text(events)
+    arrest = await try_arrest_answer(request_body, domain)
+    if arrest is not None:
+        return _voice_text(arrest)
+    zoning = await try_zoning_answer(request_body, domain, q)
+    if zoning is not None:
+        return _voice_text(zoning[0])
+    website = await try_website_answer(request_body, domain, q, system=VOICE_SYSTEM)
+    if website is not None:
+        return _voice_text(website[0])
+    return ("I'm sorry, I don't have that information right now. You can reach the City of Burbank "
+            "at (818) 238-5800.")
+
+
+@bp.websocket("/llm-websocket/<call_id>")
+async def llm_websocket(call_id):
+    """Retell Custom LLM endpoint. Handshake with a config event, then for each response_required
+    turn run the brain and stream the answer back. ping_pong is echoed; update_only is ignored."""
+    await websocket.send(json.dumps({
+        "response_type": "config",
+        "config": {"auto_reconnect": True, "call_details": False},
+    }))
+    while True:
+        try:
+            raw = await websocket.receive()
+        except asyncio.CancelledError:      # call ended / socket closed
+            break
+        try:
+            event = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        itype = event.get("interaction_type")
+        if itype == "ping_pong":
+            await websocket.send(json.dumps({
+                "response_type": "ping_pong", "timestamp": event.get("timestamp")}))
+            continue
+        if itype not in ("response_required", "reminder_required"):
+            continue                         # update_only / call_details -> nothing to say
+        response_id = event.get("response_id")
+        messages = _retell_transcript_to_messages(event.get("transcript"))
+        try:
+            answer = await run_voice_turn({"messages": messages})
+        except Exception:
+            logging.exception("voice turn failed for call %s", call_id)
+            answer = "Sorry, I ran into a problem. Could you say that again?"
+        await websocket.send(json.dumps({
+            "response_type": "response",
+            "response_id": response_id,
+            "content": answer,
+            "content_complete": True,
+        }))
 
 
 # Generic ePALS analytics agent exposed as an API for the ePALS team to integrate. Distinct from
