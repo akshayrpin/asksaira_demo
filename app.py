@@ -1528,12 +1528,16 @@ async def run_voice_turn_stream(request_body):
         return
     # Website: STREAM tokens as they generate -- the latency win. retrieval_query=q skips expansion.
     if CODE_PIPELINE_ENABLED and website_pipeline and domain in ("website", "codes") and q:
+        # FILLER FIRST: retrieval takes ~2s, and Retell hangs up if it hears nothing for ~3s. A
+        # holding phrase sent immediately resets Retell's turn timer, buying time for retrieval +
+        # the first answer token. Trim retrieval breadth (fewer candidates/smaller pool) for speed.
+        yield "Let me check that for you."
         try:
             client = await init_openai_client()
             emitted = False
             async for piece in website_pipeline.stream_website_answer(
                     q, client, app_settings.azure_openai.model,
-                    system=VOICE_SYSTEM, retrieval_query=q):
+                    system=VOICE_SYSTEM, retrieval_query=q, k=6, candidates=30, pool=15):
                 piece = _CITE_RE.sub("", piece)      # drop any [docN] marker that slips through
                 if piece:
                     emitted = True
